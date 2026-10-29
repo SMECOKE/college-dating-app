@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 
 // ============================================================================
 // SHARED INTERFACES & COLLEGE LISTS
@@ -46,18 +46,182 @@ export interface StudentProfile {
   idCardBackImage?: string;
 }
 
-export interface ChatReport {
+export interface ChatMessage {
   id: string;
-  reporterAlias: string;
-  reportedStudentId: string;
-  reportedStudentName: string;
-  reportedAlias: string;
-  offensiveText: string;
+  senderAlias: string;
+  text: string;
   timestamp: string;
+  createdAt?: number;
+  replyTo?: { id: string; senderAlias: string; text: string };
+  gif?: { url?: string; emoji?: string; label: string };
+  game?: { type: string; title: string; prompt: string; options?: string[]; lieIndex?: number; guess?: number };
+  reactions?: Record<string, string>;
+  vanish?: "off" | "seen" | "1h" | "24h";
+  expiresAt?: number;
+  seenBy?: string[];
+  seenAt?: number;
+  vanishedAt?: string; // when it vanished for the students (admin copy is permanent)
+}
+
+export interface Confession {
+  id: string;
+  college: string;
+  text: string;
+  theme: number;
+  createdAt: number;
+  authorId: string;
+  authorAlias: string;
+  reactions: Record<string, string>;
+  reports: string[];
+  hidden?: boolean;
+}
+
+const CONFESSIONS_KEY = "heartlink_confessions";
+const CONFESSION_THEMES = [
+  "from-pink-500 via-rose-500 to-orange-400",
+  "from-violet-600 via-fuchsia-500 to-pink-500",
+  "from-sky-500 via-indigo-500 to-violet-600",
+  "from-emerald-400 via-teal-500 to-cyan-600",
+  "from-amber-400 via-orange-500 to-rose-500",
+  "from-slate-700 via-purple-800 to-pink-700",
+];
+
+// Small badges shown under every message in the admin chat viewers
+function MsgExtras({ m }: { m: ChatMessage }) {
+  const reactions = Object.entries(m.reactions || {});
+  const vanishLabel =
+    m.vanish === "seen" ? "after seen" : m.vanish === "1h" ? "1 hour" : m.vanish === "24h" ? "24 hours" : "";
+  return (
+    <>
+      {m.replyTo && (
+        <div className="mb-1 px-2 py-1 rounded-lg bg-black/30 border-l-2 border-slate-500 text-[10px] opacity-80">
+          <b>↩ {m.replyTo.senderAlias}:</b> {m.replyTo.text}
+        </div>
+      )}
+      {m.gif?.url && (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={m.gif.url} alt={m.gif.label} className="rounded-lg max-h-32 w-auto my-1" />
+      )}
+      {reactions.length > 0 && (
+        <p className="text-[11px] mt-1">
+          {reactions.map(([who, e]) => (
+            <span key={who} title={who} className="mr-1">{e}</span>
+          ))}
+        </p>
+      )}
+      {(m.vanishedAt || vanishLabel) && (
+        <p className="text-[9px] mt-1 text-amber-300/90">
+          👻 {m.vanishedAt ? `Vanished for students (${m.vanishedAt}) — kept here` : `Set to vanish: ${vanishLabel}`}
+        </p>
+      )}
+    </>
+  );
+}
+
+// ============================================================================
+// FLAGGED-WORD ALERTS
+// Messages containing any of these words/phrases are highlighted for the admin.
+// The admin can add/remove words from the "Flagged words" panel in the Live tab
+// (saved in this browser under FLAGGED_WORDS_KEY).
+// ============================================================================
+const FLAGGED_WORDS_KEY = "heartlink_admin_flagged_words";
+const DEFAULT_FLAGGED_WORDS: string[] = [
+  // self-harm
+  "suicide", "kill myself", "end my life", "want to die", "self harm",
+  // threats / violence
+  "kill you", "hurt you", "beat you", "i will find you", "stalk", "acid",
+  // sexual pressure / harassment
+  "nude", "nudes", "send pics", "send photos", "sex", "rape", "hookup",
+  // blackmail / leaks
+  "blackmail", "leak", "expose you", "viral your",
+  // money & scams
+  "paytm", "gpay", "phonepe", "upi", "otp", "send money", "bitcoin", "loan",
+  // off-platform contact
+  "whatsapp", "instagram", "snapchat", "telegram",
+  // abuse
+  "fuck", "bitch", "slut", "bastard", "asshole", "madarchod", "bhenchod", "chutiya", "randi", "harami",
+];
+
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// One regex (single capture group) matching any flagged word as a whole word.
+function buildFlagRegex(words: string[]): RegExp | null {
+  const cleaned = Array.from(new Set(words.map((w) => w.trim().toLowerCase()).filter(Boolean)));
+  if (cleaned.length === 0) return null;
+  cleaned.sort((a, b) => b.length - a.length); // longest phrase first
+  return new RegExp(`\\b(${cleaned.map(escapeRegex).join("|")})\\b`, "gi");
+}
+
+// Distinct flagged words found in a piece of text (lower-cased).
+function getFlagHits(text: string | undefined, re: RegExp | null): string[] {
+  if (!re || !text) return [];
+  const found = text.match(re);
+  return found ? Array.from(new Set(found.map((f) => f.toLowerCase()))) : [];
+}
+
+// Renders text with every flagged word highlighted.
+function HighlightedText({ text, re }: { text: string; re: RegExp | null }) {
+  if (!re || !text) return <>{text}</>;
+  const parts = text.split(re); // odd indexes are the matched words
+  return (
+    <>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <mark
+            key={i}
+            className="bg-red-500/90 text-white font-bold px-1 rounded ring-1 ring-red-300/70 animate-pulse"
+            title="Flagged word"
+          >
+            {part}
+          </mark>
+        ) : (
+          <React.Fragment key={i}>{part}</React.Fragment>
+        )
+      )}
+    </>
+  );
+}
+
+export interface ReportedUserTicket {
+  id: string;
+  reportedAlias: string;
+  reporterAlias: string;
+  reporterEmail: string;
+  reason: string;
+  reportedAt: string;
+  chatHistory: ChatMessage[];
+}
+
+export interface ChatParticipant {
+  alias: string;
+  ticketId?: string;
+  fullName?: string;
+  email?: string;
+  phone?: string;
+  collegeName?: string;
+  baseLocation?: string;
+  gender?: string;
+  branch?: string;
+  year?: string;
+  yearDept?: string;
+}
+
+export interface LiveChatSession {
+  sessionId: string;
+  userEmail: string;
+  userAlias: string;
+  targetAlias: string;
+  college: string;
+  lastActive: string;
+  messages: ChatMessage[];
+  startedAt?: string;
+  endedAt?: string;
+  status?: "active" | "deleted" | "expired" | "reported" | "ended" | "unmatched";
+  participants?: ChatParticipant[];
 }
 
 type DesignMode = "kanban" | "terminal" | "obsidian";
-type ActiveSection = "verifications" | "students" | "flagged_apps" | "reports" | "blocked" | "events";
+type ActiveSection = "verifications" | "live_chats" | "students" | "flagged_apps" | "reports" | "blocked" | "confessions" | "events";
 
 const BANGALORE_COLLEGES = [
   "RV College of Engineering (RVCE)",
@@ -141,18 +305,6 @@ const INITIAL_STUDENTS: StudentProfile[] = [
   },
 ];
 
-const INITIAL_REPORTS: ChatReport[] = [
-  {
-    id: "rep_1",
-    reporterAlias: "CosmicRhythm",
-    reportedStudentId: "stu_101",
-    reportedStudentName: "Tejas",
-    reportedAlias: "MidnightCoder",
-    offensiveText: "Sending inappropriate messages during anonymous chat.",
-    timestamp: "10:42 AM",
-  },
-];
-
 export default function AdminDashboardVariants() {
   const [isUnlocked, setIsUnlocked] = useState<boolean>(false);
   const [passcode, setPasscode] = useState<string>("");
@@ -161,9 +313,129 @@ export default function AdminDashboardVariants() {
 
   const [students, setStudents] = useState<StudentProfile[]>(INITIAL_STUDENTS);
   const [verificationQueue, setVerificationQueue] = useState<StudentAccount[]>([]);
-  const [chatReports, setChatReports] = useState<ChatReport[]>(INITIAL_REPORTS);
+  const [chatReports, setChatReports] = useState<ReportedUserTicket[]>([]);
+  const [liveChatSessions, setLiveChatSessions] = useState<LiveChatSession[]>([]);
+  const [confessions, setConfessions] = useState<Confession[]>([]);
+  const [confessionCollege, setConfessionCollege] = useState<string>("All");
+
   const [previewIdImage, setPreviewIdImage] = useState<string | null>(null);
+
+  // Live tab (Instagram-style inbox)
+  const [liveSearch, setLiveSearch] = useState<string>("");
+  const [liveStudentAlias, setLiveStudentAlias] = useState<string | null>(null);
+  const [liveSessionId, setLiveSessionId] = useState<string | null>(null);
+  const [liveChatSearch, setLiveChatSearch] = useState<string>("");
+
+  // Flagged-word alerts
+  const [flaggedWords, setFlaggedWords] = useState<string[]>(DEFAULT_FLAGGED_WORDS);
+  const [showFlagPanel, setShowFlagPanel] = useState<boolean>(false);
+  const [showFlaggedOnly, setShowFlaggedOnly] = useState<boolean>(false);
+  const [newFlagWord, setNewFlagWord] = useState<string>("");
+  const flagRe = useMemo(() => buildFlagRegex(flaggedWords), [flaggedWords]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(FLAGGED_WORDS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setFlaggedWords(parsed.filter((w) => typeof w === "string"));
+      }
+    } catch {
+      // ignore – fall back to defaults
+    }
+  }, []);
+
+  const saveFlaggedWords = (next: string[]) => {
+    setFlaggedWords(next);
+    try {
+      localStorage.setItem(FLAGGED_WORDS_KEY, JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+  };
+
+  // Which live chats contain flagged words, and how many flagged messages in total
+  const flaggedSummary = useMemo(() => {
+    const bySession = new Map<string, { count: number; words: string[] }>();
+    let total = 0;
+    liveChatSessions.forEach((s) => {
+      const words = new Set<string>();
+      let count = 0;
+      (s.messages || []).forEach((m) => {
+        const hits = getFlagHits(m.text, flagRe);
+        if (hits.length > 0) {
+          count += 1;
+          hits.forEach((h) => words.add(h));
+        }
+      });
+      if (count > 0) {
+        bySession.set(s.sessionId, { count, words: Array.from(words) });
+        total += count;
+      }
+    });
+    return { bySession, total };
+  }, [liveChatSessions, flagRe]);
+
+  // Pop a toast when NEW flagged messages show up while the admin is watching
+  const prevFlaggedTotal = useRef<number | null>(null);
+  useEffect(() => {
+    if (prevFlaggedTotal.current !== null && flaggedSummary.total > prevFlaggedTotal.current) {
+      setToast(`🚩 ${flaggedSummary.total - prevFlaggedTotal.current} new flagged message(s) in live chats`);
+      setTimeout(() => setToast(null), 3500);
+    }
+    prevFlaggedTotal.current = flaggedSummary.total;
+  }, [flaggedSummary.total]);
+
+  // No zooming anywhere
+  useEffect(() => {
+    let meta = document.querySelector('meta[name="viewport"]') as HTMLMetaElement | null;
+    if (!meta) {
+      meta = document.createElement("meta");
+      meta.name = "viewport";
+      document.head.appendChild(meta);
+    }
+    meta.setAttribute(
+      "content",
+      "width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover"
+    );
+    const onWheel = (e: WheelEvent) => { if (e.ctrlKey) e.preventDefault(); };
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && ["+", "-", "=", "_", "0"].includes(e.key)) e.preventDefault();
+    };
+    const stop = (e: Event) => e.preventDefault();
+    const onTouch = (e: TouchEvent) => { if (e.touches.length > 1) e.preventDefault(); };
+    window.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKey);
+    document.addEventListener("gesturestart", stop);
+    document.addEventListener("touchmove", onTouch, { passive: false });
+    return () => {
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("gesturestart", stop);
+      document.removeEventListener("touchmove", onTouch);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!liveStudentAlias) return;
+    const prevBody = document.body.style.overflow;
+    const prevHtml = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevBody;
+      document.documentElement.style.overflow = prevHtml;
+    };
+  }, [liveStudentAlias]);
   
+  // Inspector Modals
+  const [inspectLiveSession, setInspectLiveSession] = useState<LiveChatSession | null>(null);
+  const [inspectParticipant, setInspectParticipant] = useState<{
+    label: string;
+    session: LiveChatSession;
+  } | null>(null);
+  const [inspectReportTicket, setInspectReportTicket] = useState<ReportedUserTicket | null>(null);
+
   // Modals
   const [sameNameModalData, setSameNameModalData] = useState<{ applicant: StudentAccount; matches: StudentProfile[] } | null>(null);
   const [modalFlaggedStudent, setModalFlaggedStudent] = useState<StudentProfile | null>(null);
@@ -187,10 +459,81 @@ export default function AdminDashboardVariants() {
     setTimeout(() => setToast(null), 2800);
   };
 
+  const updateConfession = (id: string, patch: Partial<Confession> | null) => {
+    const list: Confession[] = JSON.parse(localStorage.getItem(CONFESSIONS_KEY) || "[]");
+    const next = patch === null ? list.filter((c) => c.id !== id) : list.map((c) => (c.id === id ? { ...c, ...patch } : c));
+    localStorage.setItem(CONFESSIONS_KEY, JSON.stringify(next));
+    setConfessions(next);
+  };
+
+  // "NeonMuse (♀)" -> "NeonMuse"
+  const aliasFromLabel = (label: string) => label.replace(/\s*\([♂♀]\)\s*$/, "").trim();
+
+  const statusBadge = (status?: LiveChatSession["status"]) => {
+    switch (status) {
+      case "deleted":
+        return { text: "🗑 Deleted by student", cls: "bg-rose-500/15 text-rose-300 border-rose-500/30" };
+      case "expired":
+        return { text: "⏱ Expired", cls: "bg-amber-500/15 text-amber-300 border-amber-500/30" };
+      case "reported":
+        return { text: "🚩 Reported", cls: "bg-red-500/15 text-red-300 border-red-500/30" };
+      case "unmatched":
+        return { text: "💔 Student unsparked", cls: "bg-rose-500/15 text-rose-300 border-rose-500/30" };
+      case "ended":
+        return { text: "👋 Student logged out", cls: "bg-slate-500/15 text-slate-300 border-slate-500/30" };
+      default:
+        return { text: "🟢 Active", cls: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" };
+    }
+  };
+
+  // Gather EVERYTHING we know about a student from the chat snapshot,
+  // the verification queue (ID cards, ticket ID) and the students directory.
+  const resolveParticipant = (label: string, session: LiveChatSession) => {
+    const alias = aliasFromLabel(label);
+    const snap = session.participants?.find((p) => p.alias === alias);
+    const prof = students.find(
+      (st) => st.alias === alias || (snap?.email && st.email === snap.email)
+    );
+    const acc = verificationQueue.find(
+      (a) =>
+        (snap?.ticketId && a.id === snap.ticketId) ||
+        (snap?.email && a.email === snap.email) ||
+        (prof?.email && a.email === prof.email) ||
+        (prof?.id && a.id === prof.id)
+    );
+    return {
+      alias,
+      avatar: prof?.avatar,
+      ticketId: snap?.ticketId || acc?.id || prof?.id,
+      fullName: snap?.fullName || acc?.fullName || prof?.fullName,
+      email: snap?.email || acc?.email || prof?.email,
+      phone: snap?.phone || acc?.phone || prof?.phone,
+      collegeName: snap?.collegeName || acc?.collegeName || prof?.collegeName,
+      baseLocation: snap?.baseLocation || acc?.baseLocation || prof?.baseLocation,
+      gender: snap?.gender || acc?.gender || prof?.gender,
+      branch: snap?.branch || acc?.branch,
+      year: snap?.year || acc?.year,
+      yearDept: snap?.yearDept || prof?.yearDept,
+      idFront: acc?.idCardFrontImage || prof?.idCardFrontImage,
+      idBack: acc?.idCardBackImage || prof?.idCardBackImage,
+      verification: acc?.verificationStatus || prof?.status,
+      bio: prof?.bio,
+      interests: prof?.interests?.join(", "),
+      dob: prof?.dob,
+    };
+  };
+
   const syncFromCustomerApp = useCallback(() => {
+    try {
+      const list: Confession[] = JSON.parse(localStorage.getItem(CONFESSIONS_KEY) || "[]");
+      setConfessions((prev) => (JSON.stringify(prev) === JSON.stringify(list) ? prev : list));
+    } catch {
+      // ignore
+    }
     const rawQueue = localStorage.getItem("heartlink_admin_verification_queue");
     const savedUsers = localStorage.getItem("college_dating_all_users");
-    const rawReports = localStorage.getItem("heartlink_chat_reports");
+    const rawReports = localStorage.getItem("heartlink_admin_reported_chats");
+    const rawLiveChats = localStorage.getItem("heartlink_admin_live_chats");
 
     if (savedUsers) {
       try {
@@ -222,8 +565,17 @@ export default function AdminDashboardVariants() {
 
     if (rawReports) {
       try {
-        const parsedReports: ChatReport[] = JSON.parse(rawReports);
+        const parsedReports: ReportedUserTicket[] = JSON.parse(rawReports);
         setChatReports(parsedReports);
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (rawLiveChats) {
+      try {
+        const parsedLive: LiveChatSession[] = JSON.parse(rawLiveChats);
+        setLiveChatSessions(parsedLive);
       } catch {
         // Ignore
       }
@@ -380,6 +732,13 @@ export default function AdminDashboardVariants() {
     setModalFlaggedStudent(null);
     setModalBlockedStudent(null);
     triggerToast(`Permanently deleted ${target?.fullName || "student"}.`);
+  };
+
+  const dismissReport = (ticketId: string) => {
+    const updatedReports = chatReports.filter((r) => r.id !== ticketId);
+    setChatReports(updatedReports);
+    localStorage.setItem("heartlink_admin_reported_chats", JSON.stringify(updatedReports));
+    triggerToast("Report dismissed and removed from queue.");
   };
 
   const simulateNewStudent = () => {
@@ -539,6 +898,80 @@ export default function AdminDashboardVariants() {
         </div>
       )}
 
+      {/* STUDENT DETAILS MODAL (opened by clicking a name in Live chats) */}
+      {inspectParticipant && (() => {
+        const d = resolveParticipant(inspectParticipant.label, inspectParticipant.session);
+        const rows: [string, string | undefined][] = [
+          ["Full Name", d.fullName],
+          ["Alias / Username", d.alias],
+          ["Student / Ticket ID", d.ticketId],
+          ["College / School", d.collegeName],
+          ["Degree & Branch", d.branch || d.yearDept],
+          ["Study Year", d.year],
+          ["Gender", d.gender],
+          ["Email", d.email],
+          ["Mobile Number", d.phone],
+          ["Base Location", d.baseLocation],
+          ["Verification Status", d.verification],
+          ["Date of Birth", d.dob],
+          ["Bio", d.bio],
+          ["Interests", d.interests],
+        ];
+        return (
+          <div
+            onClick={() => setInspectParticipant(null)}
+            className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-slate-900 border border-slate-700 rounded-3xl p-6 max-w-lg w-full space-y-4 shadow-2xl max-h-[88vh] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div className="flex items-center gap-3">
+                  <span className="text-3xl">{d.avatar || "👤"}</span>
+                  <div>
+                    <h3 className="font-bold text-sm text-pink-400">Student Details</h3>
+                    <p className="text-[11px] text-slate-400">@{d.alias}</p>
+                  </div>
+                </div>
+                <button onClick={() => setInspectParticipant(null)} className="text-slate-400 hover:text-white text-sm cursor-pointer">✕ Close</button>
+              </div>
+
+              <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 space-y-2 text-xs">
+                {rows.map(([k, v]) => (
+                  <div key={k} className="flex justify-between gap-4 py-1 border-b border-slate-800/70 last:border-0">
+                    <span className="text-slate-400 shrink-0">{k}:</span>
+                    <span className="font-semibold text-white text-right break-all">{v || "Not available"}</span>
+                  </div>
+                ))}
+              </div>
+
+              {(d.idFront || d.idBack) ? (
+                <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 space-y-2">
+                  <h4 className="text-pink-400 font-bold uppercase tracking-wider text-[11px]">🪪 College ID Card</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    {d.idFront && (
+                      <div>
+                        <p className="text-[10px] text-slate-400 mb-1">Front (click to enlarge)</p>
+                        <img src={d.idFront} alt="ID front" onClick={() => setPreviewIdImage(d.idFront as string)} className="w-full h-28 object-cover rounded-xl border border-slate-700 cursor-pointer" />
+                      </div>
+                    )}
+                    {d.idBack && (
+                      <div>
+                        <p className="text-[10px] text-slate-400 mb-1">Back (click to enlarge)</p>
+                        <img src={d.idBack} alt="ID back" onClick={() => setPreviewIdImage(d.idBack as string)} className="w-full h-28 object-cover rounded-xl border border-slate-700 cursor-pointer" />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-[11px] text-slate-500 text-center">No college ID card images on record for this student.</p>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Lightbox Modal */}
       {previewIdImage && (
         <div
@@ -554,6 +987,160 @@ export default function AdminDashboardVariants() {
               <button onClick={() => setPreviewIdImage(null)} className="text-slate-400 hover:text-white text-sm cursor-pointer">✕ Close</button>
             </div>
             <img src={previewIdImage} alt="Full College ID" className="w-full max-h-96 object-contain rounded-2xl bg-black border border-slate-800" />
+          </div>
+        </div>
+      )}
+
+      {/* INSPECT LIVE CHAT SESSION MODAL */}
+      {inspectLiveSession && (
+        <div
+          onClick={() => setInspectLiveSession(null)}
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border border-slate-700 rounded-3xl p-6 max-w-lg w-full space-y-4 shadow-2xl max-h-[85vh] overflow-y-auto"
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div>
+                <h3 className="font-bold text-sm text-sky-400 flex items-center gap-1.5">
+                  <span>💬 Chat:</span>
+                  <button
+                    onClick={() => setInspectParticipant({ label: inspectLiveSession.userAlias, session: inspectLiveSession })}
+                    className="underline decoration-dotted hover:text-pink-400 cursor-pointer"
+                  >
+                    {inspectLiveSession.userAlias}
+                  </button>
+                  <span>↔</span>
+                  <button
+                    onClick={() => setInspectParticipant({ label: inspectLiveSession.targetAlias, session: inspectLiveSession })}
+                    className="underline decoration-dotted hover:text-pink-400 cursor-pointer"
+                  >
+                    {inspectLiveSession.targetAlias}
+                  </button>
+                </h3>
+                <p className="text-[11px] text-slate-400">Student: {inspectLiveSession.userEmail} • {inspectLiveSession.college}</p>
+                <p className="text-[10px] text-slate-500 mt-0.5">
+                  {statusBadge(inspectLiveSession.status).text}
+                  {inspectLiveSession.startedAt ? ` • Started: ${inspectLiveSession.startedAt}` : ""}
+                  {inspectLiveSession.endedAt ? ` • Ended: ${inspectLiveSession.endedAt}` : ""}
+                </p>
+                <p className="text-[10px] text-pink-400 mt-0.5">👆 Click a name to see the student&apos;s full details</p>
+              </div>
+              <button onClick={() => setInspectLiveSession(null)} className="text-slate-400 hover:text-white text-sm cursor-pointer">✕ Close</button>
+            </div>
+
+            <div className="bg-slate-950 rounded-2xl p-4 max-h-80 overflow-y-auto space-y-2.5 border border-slate-800">
+              {inspectLiveSession.messages && inspectLiveSession.messages.length > 0 ? (
+                inspectLiveSession.messages.map((m) => {
+                  const hits = getFlagHits(m.text, flagRe);
+                  return (
+                    <div
+                      key={m.id}
+                      className={`text-xs p-2.5 rounded-xl border space-y-1 ${
+                        hits.length > 0 ? "bg-red-950/40 border-red-500/70" : "bg-slate-900 border-slate-800"
+                      }`}
+                    >
+                      <div className="flex justify-between font-bold text-[10px] text-pink-400">
+                        <span>{m.senderAlias}</span>
+                        <span className="text-slate-500">{m.timestamp}</span>
+                      </div>
+                      {hits.length > 0 && (
+                        <p className="text-[9px] font-bold text-red-300">🚩 Flagged: {hits.join(", ")}</p>
+                      )}
+                      <p className="text-slate-200"><HighlightedText text={m.text} re={flagRe} /></p>
+                      <MsgExtras m={m} />
+                    </div>
+                  );
+                })
+              ) : (
+                <p className="text-xs text-slate-500 text-center py-6">No messages recorded in this session yet.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* INSPECT REPORTED TICKET MODAL */}
+      {inspectReportTicket && (
+        <div
+          onClick={() => setInspectReportTicket(null)}
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border border-slate-700 rounded-3xl p-6 max-w-lg w-full space-y-4 shadow-2xl max-h-[85vh] overflow-y-auto"
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div>
+                <h3 className="font-bold text-sm text-rose-400">🚩 Report Ticket: {inspectReportTicket.id}</h3>
+                <p className="text-[11px] text-slate-400">Reported User: <strong className="text-white">{inspectReportTicket.reportedAlias}</strong></p>
+              </div>
+              <button onClick={() => setInspectReportTicket(null)} className="text-slate-400 hover:text-white text-sm cursor-pointer">✕ Close</button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <p className="text-slate-300">
+                <strong>Reporter:</strong> {inspectReportTicket.reporterAlias} ({inspectReportTicket.reporterEmail}) • {inspectReportTicket.reportedAt}
+              </p>
+              <p className="text-amber-300 bg-amber-500/10 p-3 rounded-xl border border-amber-500/30">
+                <strong>Violation Reason:</strong> {inspectReportTicket.reason}
+              </p>
+
+              <div>
+                <p className="font-bold text-slate-400 mb-1.5">Complete Chat History (Start to Finish):</p>
+                <div className="bg-slate-950 rounded-2xl p-4 max-h-60 overflow-y-auto space-y-2.5 border border-slate-800">
+                  {inspectReportTicket.chatHistory && inspectReportTicket.chatHistory.length > 0 ? (
+                    inspectReportTicket.chatHistory.map((m) => {
+                      const hits = getFlagHits(m.text, flagRe);
+                      return (
+                        <div
+                          key={m.id}
+                          className={`text-xs p-2.5 rounded-xl border space-y-1 ${
+                            hits.length > 0 ? "bg-red-950/40 border-red-500/70" : "bg-slate-900 border-slate-800"
+                          }`}
+                        >
+                          <div className="flex justify-between font-bold text-[10px] text-pink-400">
+                            <span>{m.senderAlias}</span>
+                            <span className="text-slate-500">{m.timestamp}</span>
+                          </div>
+                          {hits.length > 0 && (
+                            <p className="text-[9px] font-bold text-red-300">🚩 Flagged: {hits.join(", ")}</p>
+                          )}
+                          <p className="text-slate-200"><HighlightedText text={m.text} re={flagRe} /></p>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <p className="text-xs text-slate-500 text-center py-4">No chat log attached.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-2 border-t border-slate-800">
+              {students.find((s) => s.alias === inspectReportTicket.reportedAlias) && (
+                <button
+                  onClick={() => {
+                    const offending = students.find((s) => s.alias === inspectReportTicket.reportedAlias);
+                    if (offending) blockStudent(offending.id);
+                    setInspectReportTicket(null);
+                  }}
+                  className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-500 rounded-xl text-xs font-semibold text-white cursor-pointer"
+                >
+                  🚨 Block Offending Student ID
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  dismissReport(inspectReportTicket.id);
+                  setInspectReportTicket(null);
+                }}
+                className="py-2.5 px-4 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs text-slate-300 cursor-pointer"
+              >
+                Dismiss Ticket
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -824,33 +1411,89 @@ export default function AdminDashboardVariants() {
             </div>
           </div>
 
-          <div className="flex gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800">
-            {[
-              { id: "verifications", label: `🪪 ID Requests (${pendingVerifications.length})` },
-              { id: "students", label: `Students (${filteredStudents.length})` },
-              { id: "reports", label: `🚩 Flagged (${flaggedList.length})` },
-              { id: "blocked", label: `🚨 Reports & Blocked (${chatReports.length + blockedList.length})` },
-              { id: "events", label: "Config" },
-            ].map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveSection(tab.id as ActiveSection)}
-                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                  activeSection === tab.id
-                    ? designMode === "terminal"
-                      ? "bg-emerald-600 text-black"
-                      : "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
-                    : "text-slate-400 hover:text-white"
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
+          {/* Navigation Tabs with LIVE Option beside ID Requests */}
+          <div className="flex gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 overflow-x-auto">
+            <button
+              onClick={() => setActiveSection("verifications")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap ${
+                activeSection === "verifications"
+                  ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              🪪 ID Requests ({pendingVerifications.length})
+            </button>
+            <button
+              onClick={() => setActiveSection("live_chats")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+                activeSection === "live_chats"
+                  ? "bg-sky-600 text-white shadow-lg shadow-sky-500/20"
+                  : "text-sky-400 bg-sky-500/10 hover:bg-sky-500/20"
+              }`}
+            >
+              <span className="w-2 h-2 rounded-full bg-sky-300 animate-pulse" />
+              🔴 Live ({liveChatSessions.length})
+              {flaggedSummary.total > 0 && (
+                <span className="px-1.5 py-0.5 rounded-full bg-red-600 text-white text-[9px] font-bold animate-pulse">
+                  🚩 {flaggedSummary.total}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => setActiveSection("students")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap ${
+                activeSection === "students"
+                  ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              Students ({filteredStudents.length})
+            </button>
+            <button
+              onClick={() => setActiveSection("reports")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap ${
+                activeSection === "reports"
+                  ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              🚩 Flagged ({flaggedList.length})
+            </button>
+            <button
+              onClick={() => setActiveSection("blocked")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap ${
+                activeSection === "blocked"
+                  ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              🚨 Reports &amp; Blocked ({chatReports.length + blockedList.length})
+            </button>
+            <button
+              onClick={() => setActiveSection("confessions")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap ${
+                activeSection === "confessions"
+                  ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              🤫 Confessions ({confessions.length})
+            </button>
+            <button
+              onClick={() => setActiveSection("events")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap ${
+                activeSection === "events"
+                  ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              Config
+            </button>
           </div>
 
           {/* Design Mode Switcher */}
           <div className="flex items-center gap-2">
-            <span className="text-[11px] text-slate-400 hidden sm:inline">UI Design:</span>
+            <span className="text-[11px] text-slate-400 hidden sm:inline">UI:</span>
             <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800">
               {(
                 [
@@ -862,7 +1505,7 @@ export default function AdminDashboardVariants() {
                 <button
                   key={mode.id}
                   onClick={() => setDesignMode(mode.id)}
-                  className={`px-3 py-1 rounded-lg text-xs font-medium transition cursor-pointer ${
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium transition cursor-pointer ${
                     designMode === mode.id
                       ? "bg-slate-800 text-pink-400 border border-pink-500/30"
                       : "text-slate-400 hover:text-white"
@@ -877,7 +1520,7 @@ export default function AdminDashboardVariants() {
               onClick={syncFromCustomerApp}
               className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-emerald-400 border border-slate-700 transition cursor-pointer"
             >
-              🔄 Sync Now
+              🔄 Sync
             </button>
           </div>
         </div>
@@ -885,22 +1528,35 @@ export default function AdminDashboardVariants() {
 
       {/* MAIN BODY */}
       <main className="max-w-7xl mx-auto px-6 py-8">
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-8">
+        <div className="grid grid-cols-1 sm:grid-cols-5 gap-4 mb-8">
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5">
             <p className="text-xs text-slate-400 uppercase">Pending ID Queue</p>
             <p className="text-3xl font-bold mt-1 text-amber-400">{pendingVerifications.length}</p>
+          </div>
+          <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5">
+            <p className="text-xs text-slate-400 uppercase">Live Active Chats</p>
+            <p className="text-3xl font-bold mt-1 text-sky-400">{liveChatSessions.length}</p>
           </div>
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5">
             <p className="text-xs text-slate-400 uppercase">Approved Students</p>
             <p className="text-3xl font-bold mt-1 text-emerald-400">{approvedList.length}</p>
           </div>
           <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5">
-            <p className="text-xs text-slate-400 uppercase">Flagged / Rejected</p>
-            <p className="text-3xl font-bold mt-1 text-rose-400">{flaggedList.length}</p>
-          </div>
-          <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5">
             <p className="text-xs text-slate-400 uppercase">Chat Reports</p>
             <p className="text-3xl font-bold mt-1 text-red-500">{chatReports.length}</p>
+          </div>
+          <div
+            onClick={() => { setActiveSection("live_chats"); setShowFlaggedOnly(true); }}
+            className={`rounded-2xl p-5 border cursor-pointer transition ${
+              flaggedSummary.total > 0
+                ? "bg-red-950/40 border-red-500/60 hover:bg-red-950/60"
+                : "bg-slate-900/80 border-slate-800"
+            }`}
+          >
+            <p className="text-xs text-slate-400 uppercase">Flagged-Word Msgs</p>
+            <p className={`text-3xl font-bold mt-1 ${flaggedSummary.total > 0 ? "text-red-400" : "text-slate-500"}`}>
+              {flaggedSummary.total}
+            </p>
           </div>
         </div>
 
@@ -1016,6 +1672,432 @@ export default function AdminDashboardVariants() {
             )}
           </div>
         )}
+
+        {/* 🔴 LIVE — INSTAGRAM-STYLE STUDENT INBOX */}
+        {activeSection === "live_chats" && (() => {
+          type LiveEntry = { alias: string; fullName: string; hasRealName: boolean; avatar?: string; sessions: LiveChatSession[] };
+          const emptySession: LiveChatSession = {
+            sessionId: "", userEmail: "", userAlias: "", targetAlias: "", college: "", lastActive: "", messages: [],
+          };
+          const map = new Map<string, LiveEntry>();
+          students.forEach((st) => {
+            map.set(st.alias, {
+              alias: st.alias,
+              fullName: st.fullName || st.alias,
+              hasRealName: !!st.fullName,
+              avatar: st.avatar,
+              sessions: [],
+            });
+          });
+          liveChatSessions.forEach((s) => {
+            [s.userAlias, s.targetAlias].forEach((label) => {
+              const alias = aliasFromLabel(label);
+              const r = resolveParticipant(label, s);
+              let e = map.get(alias);
+              if (!e) {
+                e = { alias, fullName: r.fullName || alias, hasRealName: !!r.fullName, avatar: r.avatar, sessions: [] };
+                map.set(alias, e);
+              } else if (r.fullName) {
+                e.fullName = r.fullName;
+                e.hasRealName = true;
+              }
+              e.sessions.push(s);
+            });
+          });
+
+          const all = Array.from(map.values()).sort((a, b) => a.fullName.localeCompare(b.fullName));
+          const q = liveSearch.trim().toLowerCase();
+          const visible = q
+            ? all.filter((e) => {
+                const st = students.find((x) => x.alias === e.alias);
+                return (
+                  e.fullName.toLowerCase().includes(q) ||
+                  e.alias.toLowerCase().includes(q) ||
+                  (st?.email || "").toLowerCase().includes(q) ||
+                  (st?.phone || "").includes(q) ||
+                  (st?.collegeName || "").toLowerCase().includes(q)
+                );
+              })
+            : all;
+
+          // Flagged messages SENT by a given student (across all their chats)
+          const flaggedSentBy = (e: LiveEntry) =>
+            e.sessions.reduce(
+              (n, s) =>
+                n +
+                (s.messages || []).filter(
+                  (m) => aliasFromLabel(m.senderAlias) === e.alias && getFlagHits(m.text, flagRe).length > 0
+                ).length,
+              0
+            );
+          const visibleList = showFlaggedOnly
+            ? visible.filter((e) => e.sessions.some((s) => flaggedSummary.bySession.has(s.sessionId)))
+            : visible;
+
+          const openProfile = (alias: string, session?: LiveChatSession) =>
+            setInspectParticipant({ label: alias, session: session || emptySession });
+
+          const selected = liveStudentAlias ? map.get(liveStudentAlias) : undefined;
+          const partnerOf = (s: LiveChatSession, me: string) => {
+            const otherLabel = aliasFromLabel(s.userAlias) === me ? s.targetAlias : s.userAlias;
+            const alias = aliasFromLabel(otherLabel);
+            return map.get(alias) || { alias, fullName: alias, hasRealName: false, sessions: [] as LiveChatSession[] };
+          };
+          const lastMsg = (s: LiveChatSession) =>
+            s.messages && s.messages.length > 0 ? s.messages[s.messages.length - 1] : null;
+          const activeSession = selected && liveSessionId
+            ? selected.sessions.find((s) => s.sessionId === liveSessionId)
+            : undefined;
+
+          const closeLiveModal = () => {
+            setLiveStudentAlias(null);
+            setLiveSessionId(null);
+            setLiveChatSearch("");
+          };
+          const cq = liveChatSearch.trim().toLowerCase();
+          const sessionMatches = (sess: LiveChatSession) => {
+            if (!selected || !cq) return true;
+            const partner = partnerOf(sess, selected.alias);
+            return (
+              partner.fullName.toLowerCase().includes(cq) ||
+              (sess.messages || []).some((m) => m.text.toLowerCase().includes(cq))
+            );
+          };
+
+          return (
+            <div className="space-y-4">
+              <div>
+                <h2 className="text-lg font-bold flex items-center gap-2">
+                  <span>🔴 Live — All Students</span>
+                  <span className="w-2.5 h-2.5 rounded-full bg-sky-400 animate-ping" />
+                </h2>
+                <p className="text-xs text-slate-400">Click a student to open their chats in a new window. Chats are never removed from here.</p>
+              </div>
+
+              {/* FLAGGED-WORD ALERT BAR */}
+              <div
+                className={`rounded-2xl border p-3 space-y-3 ${
+                  flaggedSummary.total > 0 ? "bg-red-950/30 border-red-500/50" : "bg-slate-900 border-slate-800"
+                }`}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-bold text-red-300">
+                    {flaggedSummary.total > 0
+                      ? `🚩 ${flaggedSummary.total} flagged message${flaggedSummary.total === 1 ? "" : "s"} in ${flaggedSummary.bySession.size} chat${flaggedSummary.bySession.size === 1 ? "" : "s"}`
+                      : "✅ No flagged words in any chat"}
+                  </span>
+                  <div className="flex-1" />
+                  <button
+                    onClick={() => setShowFlaggedOnly((v) => !v)}
+                    className={`px-3 py-1 rounded-lg text-[11px] font-semibold cursor-pointer border ${
+                      showFlaggedOnly
+                        ? "bg-red-600 text-white border-red-400"
+                        : "bg-slate-950 text-slate-300 border-slate-700 hover:border-red-500"
+                    }`}
+                  >
+                    {showFlaggedOnly ? "Showing flagged only" : "Show flagged only"}
+                  </button>
+                  <button
+                    onClick={() => setShowFlagPanel((v) => !v)}
+                    className="px-3 py-1 rounded-lg text-[11px] font-semibold cursor-pointer bg-slate-950 text-slate-300 border border-slate-700 hover:border-sky-500"
+                  >
+                    ⚙️ Flagged words ({flaggedWords.length})
+                  </button>
+                </div>
+
+                {showFlagPanel && (
+                  <div className="space-y-2 border-t border-slate-800 pt-3">
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={newFlagWord}
+                        onChange={(e) => setNewFlagWord(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            const w = newFlagWord.trim().toLowerCase();
+                            if (w && !flaggedWords.includes(w)) saveFlaggedWords([...flaggedWords, w]);
+                            setNewFlagWord("");
+                          }
+                        }}
+                        placeholder="Add a word or phrase and press Enter..."
+                        className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-red-500"
+                      />
+                      <button
+                        onClick={() => {
+                          const w = newFlagWord.trim().toLowerCase();
+                          if (w && !flaggedWords.includes(w)) saveFlaggedWords([...flaggedWords, w]);
+                          setNewFlagWord("");
+                        }}
+                        className="px-3 py-2 rounded-xl bg-red-600 text-white text-xs font-semibold cursor-pointer hover:bg-red-500"
+                      >
+                        Add
+                      </button>
+                      <button
+                        onClick={() => saveFlaggedWords(DEFAULT_FLAGGED_WORDS)}
+                        className="px-3 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs cursor-pointer hover:bg-slate-700"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto">
+                      {flaggedWords.map((w) => (
+                        <span
+                          key={w}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-500/15 border border-red-500/30 text-red-200 text-[10px]"
+                        >
+                          {w}
+                          <button
+                            onClick={() => saveFlaggedWords(flaggedWords.filter((x) => x !== w))}
+                            className="text-red-300 hover:text-white cursor-pointer"
+                            aria-label={`Remove ${w}`}
+                          >
+                            ✕
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <input
+                type="text"
+                value={liveSearch}
+                onChange={(e) => setLiveSearch(e.target.value)}
+                placeholder="🔍 Search student by name, email, mobile or college..."
+                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500"
+              />
+
+              {visibleList.length === 0 ? (
+                <div className="bg-slate-900 border border-slate-800 rounded-3xl p-12 text-center space-y-2">
+                  <div className="text-3xl">📡</div>
+                  <h3 className="font-bold text-sm text-slate-300">
+                    {showFlaggedOnly ? "No flagged chats right now" : "No students found"}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    {showFlaggedOnly
+                      ? "Chats that contain a flagged word will appear here."
+                      : "Students appear here as they sign up and chat in the student portal."}
+                  </p>
+                </div>
+              ) : (
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl divide-y divide-slate-800 overflow-hidden">
+                  {visibleList.map((e) => {
+                    const sentFlags = flaggedSentBy(e);
+                    return (
+                    <div
+                      key={e.alias}
+                      onClick={() => { setLiveStudentAlias(e.alias); setLiveSessionId(null); setLiveChatSearch(""); }}
+                      className={`flex items-center gap-3 px-4 py-3 hover:bg-slate-800/60 cursor-pointer transition ${
+                        sentFlags > 0 ? "bg-red-950/30 border-l-4 border-red-500" : ""
+                      }`}
+                    >
+                      <div className="w-11 h-11 rounded-full bg-gradient-to-br from-pink-500/30 to-violet-500/30 border border-slate-700 flex items-center justify-center text-xl flex-shrink-0">
+                        {e.avatar || "👤"}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-white truncate">{e.fullName}</p>
+                        {!e.hasRealName && <p className="text-[10px] text-amber-400">Real name not available</p>}
+                      </div>
+                      {sentFlags > 0 && (
+                        <span className="text-[10px] font-bold text-white bg-red-600 px-2 py-0.5 rounded-full flex-shrink-0 animate-pulse">
+                          🚩 {sentFlags}
+                        </span>
+                      )}
+                      <span className="text-[10px] text-sky-300 bg-sky-500/10 border border-sky-500/30 px-2 py-0.5 rounded-full flex-shrink-0">
+                        {e.sessions.length} chat{e.sessions.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* STUDENT CHATS POPUP WINDOW */}
+              {selected && (
+                <div
+                  onClick={closeLiveModal}
+                  className="fixed inset-0 z-40 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+                >
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    className={`bg-slate-900 border border-slate-700 rounded-3xl max-w-2xl w-full ${activeSession ? "h-[90vh]" : "max-h-[90vh]"} flex flex-col shadow-2xl overflow-hidden`}
+                  >
+                    {/* Header */}
+                    <div className="flex items-center gap-3 px-5 py-4 border-b border-slate-800 shrink-0">
+                      {activeSession && (
+                        <button
+                          onClick={() => { setLiveSessionId(null); setLiveChatSearch(""); }}
+                          className="text-slate-400 hover:text-white text-sm cursor-pointer"
+                        >
+                          ←
+                        </button>
+                      )}
+                      <div className="w-10 h-10 rounded-full bg-gradient-to-br from-pink-500/30 to-violet-500/30 border border-slate-700 flex items-center justify-center text-lg flex-shrink-0">
+                        {selected.avatar || "👤"}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-bold text-white truncate">{selected.fullName}</p>
+                        <p className="text-[10px] text-slate-400">
+                          {selected.sessions.length} conversation{selected.sessions.length === 1 ? "" : "s"}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => openProfile(selected.alias, selected.sessions[0])}
+                        className="px-3 py-1.5 rounded-lg bg-pink-600/20 border border-pink-500/40 text-pink-300 text-xs font-semibold hover:bg-pink-600/30 cursor-pointer"
+                      >
+                        👤 Profile
+                      </button>
+                      <button onClick={closeLiveModal} className="text-slate-400 hover:text-white text-sm cursor-pointer">✕</button>
+                    </div>
+
+                    {/* Search inside chats */}
+                    <div className="px-5 py-3 border-b border-slate-800 shrink-0">
+                      <input
+                        type="text"
+                        value={liveChatSearch}
+                        onChange={(e) => setLiveChatSearch(e.target.value)}
+                        placeholder={activeSession ? "🔍 Search in this chat..." : "🔍 Search chats by name or message..."}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2 text-xs text-white focus:outline-none focus:border-sky-500"
+                      />
+                    </div>
+
+                    {/* Top strip: everyone this student has texted */}
+                    {!activeSession && selected.sessions.length > 0 && (
+                      <div className="flex gap-3 overflow-x-auto px-5 py-3 border-b border-slate-800 shrink-0">
+                        {selected.sessions.filter(sessionMatches).map((sess) => {
+                          const partner = partnerOf(sess, selected.alias);
+                          const isOpen = sess.sessionId === liveSessionId;
+                          return (
+                            <button
+                              key={sess.sessionId}
+                              onClick={() => setLiveSessionId(sess.sessionId)}
+                              className="flex flex-col items-center gap-1 flex-shrink-0 w-20 cursor-pointer"
+                            >
+                              <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 ${
+                                flaggedSummary.bySession.has(sess.sessionId)
+                                  ? "border-red-500 bg-red-500/20 animate-pulse"
+                                  : isOpen ? "border-sky-400 bg-sky-500/20" : "border-slate-700 bg-slate-900 hover:border-pink-500"
+                              }`}>
+                                {partner.avatar || "👤"}
+                              </div>
+                              <span className={`text-[10px] truncate w-full text-center ${isOpen ? "text-sky-300 font-bold" : "text-slate-300"}`}>
+                                {partner.fullName}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Body */}
+                    <div className={`flex-1 min-h-0 overscroll-contain ${activeSession ? "flex flex-col overflow-hidden" : "overflow-y-auto"}`}>
+                      {activeSession ? (() => {
+                        const partner = partnerOf(activeSession, selected.alias);
+                        const msgs = (activeSession.messages || []).filter(
+                          (m) => !cq || m.text.toLowerCase().includes(cq)
+                        );
+                        return (
+                          <div className="flex flex-col flex-1 min-h-0">
+                            <div className="flex items-center gap-3 px-5 py-3 border-b border-slate-800 shrink-0">
+                              <div className="w-9 h-9 rounded-full bg-slate-800 flex items-center justify-center text-lg flex-shrink-0">
+                                {partner.avatar || "👤"}
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm font-bold text-white truncate">{partner.fullName}</p>
+                                <p className="text-[10px] text-slate-500">
+                                  {statusBadge(activeSession.status).text}
+                                  {activeSession.startedAt ? ` • Started: ${activeSession.startedAt}` : ""}
+                                  {activeSession.endedAt ? ` • Ended: ${activeSession.endedAt}` : ""}
+                                </p>
+                              </div>
+                              <button
+                                onClick={() => openProfile(partner.alias, activeSession)}
+                                className="px-3 py-1.5 rounded-lg bg-pink-600/20 border border-pink-500/40 text-pink-300 text-xs font-semibold hover:bg-pink-600/30 cursor-pointer"
+                              >
+                                👤 Profile
+                              </button>
+                            </div>
+                            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-5 space-y-2 bg-slate-950">
+                              {msgs.length > 0 ? (
+                                msgs.map((m) => {
+                                  const mine = aliasFromLabel(m.senderAlias) === selected.alias;
+                                  const hits = getFlagHits(m.text, flagRe);
+                                  return (
+                                    <div key={m.id} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
+                                      <div className={`max-w-[75%] rounded-2xl px-3 py-2 text-xs ${mine ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white" : "bg-slate-800 text-slate-100"} ${hits.length > 0 ? "ring-2 ring-red-500 shadow-lg shadow-red-500/30" : ""}`}>
+                                        {hits.length > 0 && (
+                                          <p className="text-[9px] font-bold text-red-300 bg-red-950/70 rounded px-1.5 py-0.5 mb-1 inline-block">
+                                            🚩 Flagged: {hits.join(", ")}
+                                          </p>
+                                        )}
+                                        <p><HighlightedText text={m.text} re={flagRe} /></p>
+                                        <MsgExtras m={m} />
+                                        <p className="text-[9px] opacity-60 mt-1 text-right">{m.timestamp}</p>
+                                      </div>
+                                    </div>
+                                  );
+                                })
+                              ) : (
+                                <p className="text-xs text-slate-500 text-center py-8">
+                                  {cq ? "No messages match your search." : "No messages recorded in this chat yet."}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })() : selected.sessions.length === 0 ? (
+                        <div className="p-10 text-center space-y-2">
+                          <div className="text-3xl">💤</div>
+                          <p className="text-xs text-slate-400">{selected.fullName} has not texted anyone yet.</p>
+                        </div>
+                      ) : (
+                        <div className="divide-y divide-slate-800">
+                          {selected.sessions.filter(sessionMatches).map((sess) => {
+                            const partner = partnerOf(sess, selected.alias);
+                            const lm = lastMsg(sess);
+                            return (
+                              <div
+                                key={sess.sessionId}
+                                onClick={() => setLiveSessionId(sess.sessionId)}
+                                className={`flex items-center gap-3 px-5 py-3 hover:bg-slate-800/60 cursor-pointer transition ${
+                                  flaggedSummary.bySession.has(sess.sessionId) ? "bg-red-950/30 border-l-4 border-red-500" : ""
+                                }`}
+                              >
+                                <div className="w-11 h-11 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-xl flex-shrink-0">
+                                  {partner.avatar || "👤"}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm font-semibold text-white truncate">{partner.fullName}</p>
+                                  <p className="text-[11px] text-slate-400 truncate">{lm ? lm.text : "No messages yet"}</p>
+                                  {flaggedSummary.bySession.has(sess.sessionId) && (
+                                    <p className="text-[10px] text-red-300 truncate">
+                                      🚩 {flaggedSummary.bySession.get(sess.sessionId)!.count} flagged •{" "}
+                                      {flaggedSummary.bySession.get(sess.sessionId)!.words.slice(0, 4).join(", ")}
+                                    </p>
+                                  )}
+                                </div>
+                                <div className="text-right flex-shrink-0 space-y-1">
+                                  <p className="text-[9px] text-sky-400 font-mono">{sess.lastActive}</p>
+                                  <span className={`inline-block px-2 py-0.5 rounded-full border text-[9px] font-semibold ${statusBadge(sess.status).cls}`}>
+                                    {statusBadge(sess.status).text}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                          {selected.sessions.filter(sessionMatches).length === 0 && (
+                            <p className="text-xs text-slate-500 text-center py-8">No chats match your search.</p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* STUDENTS DIRECTORY WITH CASCADING FILTERS */}
         {activeSection === "students" && (
@@ -1178,51 +2260,42 @@ export default function AdminDashboardVariants() {
           </div>
         )}
 
-        {/* REPORTS & BLOCKED STUDENTS SECTION */}
+        {/* 🚨 COMPACT REPORTS & BLOCKED SECTION */}
         {activeSection === "blocked" && (
           <div className="space-y-6">
             <div>
               <h2 className="text-lg font-bold">🚨 Chat Reports &amp; Blocked Students</h2>
-              <p className="text-xs text-slate-400">Review user chat reports below. You can permanently block offenders or inspect their records.</p>
+              <p className="text-xs text-slate-400">Compact summary of reports. Click any report ticket to inspect who reported whom and review the full chat log.</p>
             </div>
 
             <div className="space-y-3">
-              <h3 className="text-sm font-bold text-amber-400">💬 Active Chat Reports ({chatReports.length})</h3>
+              <h3 className="text-sm font-bold text-amber-400">💬 Active Reported Chat Tickets ({chatReports.length})</h3>
               {chatReports.length === 0 ? (
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center text-slate-400 text-xs">No active chat reports.</div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {chatReports.map((rep) => {
-                    const offendingStudent = students.find((s) => s.id === rep.reportedStudentId);
-                    return (
-                      <div key={rep.id} className="bg-slate-900 border border-amber-500/40 rounded-2xl p-4 space-y-2 text-xs">
-                        <div className="flex justify-between items-center font-bold text-amber-300">
-                          <span>Reported: {rep.reportedStudentName} (@{rep.reportedAlias})</span>
-                          <span className="text-[10px] text-slate-400">{rep.timestamp}</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                  {chatReports.map((ticket) => (
+                    <div
+                      key={ticket.id}
+                      onClick={() => setInspectReportTicket(ticket)}
+                      className="bg-slate-900 border border-amber-500/40 hover:border-amber-500/80 rounded-2xl p-4 space-y-2 shadow-lg cursor-pointer transition flex items-center justify-between"
+                    >
+                      <div className="space-y-1 truncate pr-2">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs">🚩</span>
+                          <h4 className="font-bold text-xs text-amber-300 truncate">
+                            {ticket.reporterAlias} ➔ {ticket.reportedAlias}
+                          </h4>
                         </div>
-                        <p className="text-slate-300"><strong>Reported By:</strong> {rep.reporterAlias}</p>
-                        <p className="bg-slate-950 p-2.5 rounded-xl border border-slate-800 text-rose-300 font-mono">
-                          &ldquo;{rep.offensiveText}&rdquo;
-                        </p>
-                        {offendingStudent && (
-                          <div className="flex gap-2 pt-2">
-                            <button
-                              onClick={() => blockStudent(offendingStudent.id)}
-                              className="flex-1 py-2 bg-rose-600 hover:bg-rose-500 rounded-xl font-semibold text-white cursor-pointer"
-                            >
-                              🚨 Block Student ID Now
-                            </button>
-                            <button
-                              onClick={() => setManagedStudent(offendingStudent)}
-                              className="py-2 px-3 bg-slate-800 hover:bg-slate-700 rounded-xl text-slate-300 cursor-pointer"
-                            >
-                              Manage
-                            </button>
-                          </div>
-                        )}
+                        <p className="text-[10px] text-slate-400 truncate">Reason: {ticket.reason}</p>
+                        <p className="text-[9px] text-slate-500 font-mono">{ticket.reportedAt}</p>
                       </div>
-                    );
-                  })}
+
+                      <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 text-base flex-shrink-0 shadow">
+                        📋
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -1266,6 +2339,86 @@ export default function AdminDashboardVariants() {
         )}
 
         {/* CONFIG SECTION */}
+        {activeSection === "confessions" && (() => {
+          const colleges = Array.from(new Set(confessions.map((c) => c.college))).sort();
+          const shown = confessions
+            .filter((c) => confessionCollege === "All" || c.college === confessionCollege)
+            .sort((a, b) => b.createdAt - a.createdAt);
+          return (
+            <div className="space-y-5">
+              <div className="flex flex-wrap items-end justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold">🤫 Anonymous Confessions</h2>
+                  <p className="text-xs text-slate-400">
+                    Students see these as anonymous. Only you can see who wrote them. Posts with 3+ reports are auto-hidden from students.
+                  </p>
+                </div>
+                <select
+                  value={confessionCollege}
+                  onChange={(e) => setConfessionCollege(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200 max-w-[260px]"
+                >
+                  <option value="All">All colleges</option>
+                  {colleges.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
+
+              {shown.length === 0 ? (
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center text-slate-400 text-xs">
+                  No confessions yet.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                  {shown.map((c) => (
+                    <div
+                      key={c.id}
+                      className={`rounded-2xl border p-4 space-y-3 bg-slate-900 ${
+                        c.hidden ? "border-rose-500/50 opacity-70" : c.reports.length > 0 ? "border-amber-500/50" : "border-slate-800"
+                      }`}
+                    >
+                      <div className={`rounded-xl p-3 bg-gradient-to-br ${CONFESSION_THEMES[c.theme % CONFESSION_THEMES.length]} text-white text-sm font-semibold whitespace-pre-wrap break-words`}>
+                        {c.text}
+                      </div>
+                      <div className="text-[11px] text-slate-400 space-y-0.5">
+                        <p>🏫 {c.college}</p>
+                        <p>✍️ Author: <span className="text-slate-200 font-semibold">{c.authorAlias}</span> <span className="text-slate-500">({c.authorId})</span></p>
+                        <p>🕒 {new Date(c.createdAt).toLocaleString()}</p>
+                        <p>
+                          ❤️ {Object.keys(c.reactions).length} reactions · 🚩 {c.reports.length} report{c.reports.length === 1 ? "" : "s"}
+                          {c.hidden ? " · 🙈 Hidden by admin" : c.reports.length >= 3 ? " · 🙈 Auto-hidden" : ""}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => {
+                            const restoring = !!c.hidden || c.reports.length >= 3;
+                            updateConfession(c.id, restoring ? { hidden: false, reports: [] } : { hidden: true });
+                            triggerToast(restoring ? "Confession restored" : "Confession hidden from students");
+                          }}
+                          className="flex-1 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold cursor-pointer"
+                        >
+                          {c.hidden || c.reports.length >= 3 ? "👁 Restore" : "🙈 Hide"}
+                        </button>
+                        <button
+                          onClick={() => {
+                            updateConfession(c.id, null);
+                            triggerToast("Confession deleted");
+                          }}
+                          className="flex-1 py-1.5 rounded-lg bg-rose-600/20 border border-rose-500/40 text-rose-300 hover:bg-rose-600/30 text-xs font-semibold cursor-pointer"
+                        >
+                          🗑 Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         {activeSection === "events" && (
           <div className="max-w-xl bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-4">
             <h3 className="font-bold text-base">Campus Icebreaker Prompt</h3>
