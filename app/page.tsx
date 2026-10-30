@@ -585,6 +585,8 @@ const emojiList = (ranges: [number, number][], extra: string[] = []): string[] =
   return Array.from(new Set(all.concat(extra)));
 };
 const RECENT_EMOJI_KEY = "heartlink_recent_emojis";
+const PRESENCE_KEY = "heartlink_presence"; // { [profileId]: lastActiveTimestamp }
+const ONLINE_WINDOW_MS = 25000; // active within the last 25s = online
 const EMOJI_CATEGORIES: { id: string; label: string; emojis: string[] }[] = [
   {
     id: "smileys",
@@ -659,6 +661,77 @@ const CHAT_ANIM_CSS = `
 .gif-tile { animation: gifIn .35s cubic-bezier(.2,.8,.2,1) both; }
 .gif-skel { background: linear-gradient(90deg, rgba(255,255,255,.05) 0, rgba(255,255,255,.14) 50%, rgba(255,255,255,.05) 100%); background-size: 400px 100%; animation: shimmer 1.2s linear infinite; }
 `;
+// ---- Global feel: press feedback, ⚡/❤️ bursts, frosted-glass cards ----
+const GLOBAL_FX_CSS = `
+/* 1) PRESS FEEDBACK – every button squishes a little and springs back.
+      Uses the independent "scale" property so it never fights Tailwind's transform classes. */
+button:not(:disabled), [role="button"] {
+  transition-property: color, background-color, border-color, opacity, box-shadow, transform, scale, filter !important;
+  transition-timing-function: cubic-bezier(.34,1.56,.64,1) !important;
+  -webkit-tap-highlight-color: transparent;
+}
+button:not(:disabled):active, [role="button"]:active { scale: .93; }
+/* Spark & Pass get a bigger squish, and Spark keeps a soft glowing pulse */
+button[title="Pass"]:not(:disabled):active { scale: .86; }
+button[title="Send Spark request"]:not(:disabled):active { scale: .84; }
+button[title="Send Spark request"] { animation: sparkPulse 2.6s ease-in-out infinite; }
+@keyframes sparkPulse {
+  0%,100% { box-shadow: 0 10px 25px -5px rgba(236,72,153,.5), 0 0 0 0 rgba(236,72,153,.45); }
+  50%     { box-shadow: 0 10px 25px -5px rgba(236,72,153,.5), 0 0 0 9px rgba(236,72,153,0); }
+}
+
+/* 2) BURSTS – ⚡ flies out and ❤️ floats up when you Spark; ✕ puffs away when you Pass */
+.fx-part {
+  position: absolute; left: 0; top: 0; line-height: 1; font-size: 22px; opacity: 0;
+  animation: fxFly .9s cubic-bezier(.2,.8,.3,1) forwards; will-change: transform, opacity;
+  filter: drop-shadow(0 0 8px rgba(236,72,153,.7));
+}
+.fx-pass { color: rgba(255,255,255,.85); font-weight: 800; filter: none; }
+@keyframes fxFly {
+  0%   { opacity: 0; transform: translate(-50%,-50%) scale(.3) rotate(0deg); }
+  15%  { opacity: 1; }
+  100% { opacity: 0; transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))) scale(var(--s,1)) rotate(var(--r,0deg)); }
+}
+.fx-ring {
+  position: absolute; left: 0; top: 0; width: 56px; height: 56px; border-radius: 9999px;
+  transform: translate(-50%,-50%); animation: fxRing .6s ease-out forwards;
+}
+.fx-ring-spark { border: 2px solid rgba(244,114,182,.9); box-shadow: 0 0 22px rgba(236,72,153,.7); }
+.fx-ring-pass  { border: 2px solid rgba(255,255,255,.5); }
+@keyframes fxRing {
+  0%   { opacity: .9; transform: translate(-50%,-50%) scale(.3); }
+  100% { opacity: 0;  transform: translate(-50%,-50%) scale(2.6); }
+}
+
+/* 3) GLASSMORPHISM – frosted glass with a thin glowing gradient border */
+.glass-card {
+  background:
+    linear-gradient(145deg, rgba(255,255,255,.10) 0%, rgba(255,255,255,.03) 45%, rgba(255,255,255,.06) 100%),
+    rgba(14,6,24,.55) !important;
+  -webkit-backdrop-filter: blur(22px) saturate(165%);
+  backdrop-filter: blur(22px) saturate(165%);
+  border-color: rgba(255,255,255,.07) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.18),
+    0 0 0 1px rgba(236,72,153,.10),
+    0 12px 45px -12px rgba(236,72,153,.40),
+    0 2px 14px rgba(0,0,0,.45) !important;
+}
+.glass-card:not(.absolute):not(.fixed):not(.sticky) { position: relative; }
+.glass-card::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; padding: 1px; pointer-events: none;
+  background: linear-gradient(135deg, rgba(244,114,182,.75), rgba(255,255,255,.10) 38%, rgba(255,255,255,.04) 62%, rgba(139,92,246,.70));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button[title="Send Spark request"] { animation: none; }
+  .fx-part, .fx-ring { display: none; }
+}
+`;
+type FxPart = { ch: string; dx: number; dy: number; s: number; r: number; delay: number; dur: number };
+type FxBurst = { id: number; x: number; y: number; kind: "spark" | "pass"; parts: FxPart[] };
 const QUICK_REACTIONS = ["❤️", "😂", "😮", "😢", "🔥", "👍"];
 
 // ---- Couple games ----
@@ -2283,6 +2356,125 @@ export default function StudentPage() {
       document.removeEventListener("keydown", onEsc);
     };
   }, [showChatMenu]);
+
+  // ---- Online / last-seen presence ----
+  // Every signed-in student stamps "I'm active" every 10s while the tab is visible.
+  const [presence, setPresence] = useState<Record<string, number>>({});
+  useEffect(() => {
+    const read = () => {
+      try {
+        const raw = JSON.parse(localStorage.getItem(PRESENCE_KEY) || "{}");
+        setPresence(raw && typeof raw === "object" ? raw : {});
+      } catch {
+        setPresence({});
+      }
+    };
+    const beat = () => {
+      if (!myProfile?.id || document.visibilityState !== "visible") return;
+      try {
+        const raw = JSON.parse(localStorage.getItem(PRESENCE_KEY) || "{}");
+        raw[myProfile.id] = Date.now();
+        localStorage.setItem(PRESENCE_KEY, JSON.stringify(raw));
+      } catch {
+        // ignore
+      }
+    };
+    beat();
+    read();
+    const beatTimer = setInterval(beat, 10000);
+    const readTimer = setInterval(read, 5000);
+    const onVisible = () => {
+      beat();
+      read();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("storage", read);
+    return () => {
+      clearInterval(beatTimer);
+      clearInterval(readTimer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("storage", read);
+    };
+  }, [myProfile?.id]);
+
+  const presenceInfo = (id?: string): { online: boolean; label: string } => {
+    const ts = id ? presence[id] : undefined;
+    if (!ts) return { online: false, label: "Offline" };
+    const diff = Date.now() - ts;
+    if (diff < ONLINE_WINDOW_MS) return { online: true, label: "Online" };
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return { online: false, label: "Last seen just now" };
+    if (mins < 60) return { online: false, label: `Last seen ${mins}m ago` };
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return { online: false, label: `Last seen ${hrs}h ago` };
+    return { online: false, label: `Last seen ${Math.floor(hrs / 24)}d ago` };
+  };
+
+  // ⚡ / ❤️ / ✕ burst effects (fired from Spark, Pass, Accept and Reject buttons)
+  const fxCounter = useRef<number>(0);
+  const [fxBursts, setFxBursts] = useState<FxBurst[]>([]);
+  const triggerFx = (e: React.MouseEvent<HTMLElement>, kind: "spark" | "pass") => {
+    try {
+      if (typeof navigator !== "undefined" && "vibrate" in navigator) navigator.vibrate(kind === "spark" ? [14, 30, 14] : 10);
+    } catch {
+      // ignore
+    }
+    if (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const rnd = (a: number, b: number) => a + Math.random() * (b - a);
+    const parts: FxPart[] = [];
+    if (kind === "spark") {
+      for (let i = 0; i < 7; i++) {
+        const ang = (i / 7) * Math.PI * 2 + rnd(-0.3, 0.3);
+        const dist = rnd(60, 115);
+        parts.push({ ch: "⚡", dx: Math.cos(ang) * dist, dy: Math.sin(ang) * dist, s: rnd(0.9, 1.4), r: rnd(-40, 40), delay: 0, dur: 0.75 });
+      }
+      const hearts = ["❤️", "💖", "💗", "💘"];
+      for (let i = 0; i < 6; i++) {
+        parts.push({ ch: hearts[i % hearts.length], dx: rnd(-70, 70), dy: rnd(-230, -130), s: rnd(0.9, 1.6), r: rnd(-25, 25), delay: rnd(0, 0.25), dur: rnd(1.0, 1.4) });
+      }
+    } else {
+      for (let i = 0; i < 6; i++) {
+        parts.push({ ch: i % 2 === 0 ? "✕" : "💨", dx: rnd(-95, 95), dy: rnd(-25, 75), s: rnd(0.7, 1.2), r: rnd(-60, 60), delay: 0, dur: 0.6 });
+      }
+    }
+    const id = ++fxCounter.current;
+    setFxBursts((prev) => [...prev, { id, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, kind, parts }]);
+    setTimeout(() => setFxBursts((prev) => prev.filter((b) => b.id !== id)), 1900);
+  };
+
+  const fxLayer = (
+    <>
+      <style>{GLOBAL_FX_CSS}</style>
+      {fxBursts.length > 0 && (
+        <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-[95] overflow-hidden">
+          {fxBursts.map((b) => (
+            <div key={b.id} className="absolute" style={{ left: b.x, top: b.y }}>
+              <span className={`fx-ring ${b.kind === "spark" ? "fx-ring-spark" : "fx-ring-pass"}`} />
+              {b.parts.map((p, i) => (
+                <span
+                  key={i}
+                  className={`fx-part ${b.kind === "pass" ? "fx-pass" : ""}`}
+                  style={
+                    {
+                      "--dx": `${p.dx}px`,
+                      "--dy": `${p.dy}px`,
+                      "--s": p.s,
+                      "--r": `${p.r}deg`,
+                      animationDelay: `${p.delay}s`,
+                      animationDuration: `${p.dur}s`,
+                    } as React.CSSProperties
+                  }
+                >
+                  {p.ch}
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
   const [vanishHintSeen, setVanishHintSeen] = useState<boolean>(true);
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [actionMsgId, setActionMsgId] = useState<string | null>(null);
@@ -2840,10 +3032,11 @@ export default function StudentPage() {
 
     return (
       <main className="relative min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4 font-sans overflow-hidden">
+        {fxLayer}
         <FpsMotionBackground boost={fpsBoost || isSendingOtp || isSubmitting} />
 
         <div
-          className={`relative z-10 w-full bg-slate-900/85 backdrop-blur-xl border border-pink-500/30 rounded-3xl shadow-2xl shadow-pink-500/10 ${
+          className={`relative z-10 w-full bg-slate-900/85 backdrop-blur-xl glass-card border border-pink-500/30 rounded-3xl shadow-2xl shadow-pink-500/10 ${
             authStep === "kyc"
               ? "max-w-md lg:max-w-4xl p-4 lg:p-6 space-y-2 lg:space-y-3"
               : "max-w-md lg:max-w-2xl p-6 lg:p-10 space-y-5 lg:space-y-7 lg:[&_input]:text-base lg:[&_input]:py-3.5 lg:[&_select]:text-base lg:[&_select]:py-3.5 lg:[&_label]:text-sm lg:[&_button]:text-base"
@@ -3246,8 +3439,9 @@ export default function StudentPage() {
   ) {
     return (
       <main className="relative min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4 overflow-hidden">
+        {fxLayer}
         <FpsMotionBackground boost={false} />
-        <div className="relative z-10 max-w-md lg:max-w-xl w-full bg-slate-900/85 backdrop-blur-xl border border-slate-800 rounded-3xl p-6 lg:p-10 text-center space-y-5 shadow-2xl">
+        <div className="relative z-10 max-w-md lg:max-w-xl w-full bg-slate-900/85 backdrop-blur-xl glass-card border border-slate-800 rounded-3xl p-6 lg:p-10 text-center space-y-5 shadow-2xl">
           <div className="w-16 h-16 rounded-2xl bg-amber-500/10 border border-amber-500/30 mx-auto flex items-center justify-center text-3xl">
             {account.verificationStatus === "rejected" ? "❌" : "⏳"}
           </div>
@@ -3299,13 +3493,13 @@ export default function StudentPage() {
           </div>
           <div className="flex gap-2">
             <button
-              onClick={() => handleRejectSpark(r)}
+              onClick={(e) => { triggerFx(e, "pass"); handleRejectSpark(r); }}
               className="flex-1 h-10 rounded-full bg-white/10 border border-white/15 text-xs font-semibold cursor-pointer hover:bg-rose-500/30 transition"
             >
               ✕ Reject
             </button>
             <button
-              onClick={() => handleAcceptSpark(r)}
+              onClick={(e) => { triggerFx(e, "spark"); handleAcceptSpark(r); }}
               className="flex-1 h-10 rounded-full bg-gradient-to-r from-pink-500 to-rose-600 text-xs font-bold cursor-pointer shadow-lg shadow-pink-600/40"
             >
               ✓ Accept
@@ -3383,6 +3577,7 @@ export default function StudentPage() {
           "radial-gradient(ellipse 80% 55% at 100% 0%, rgba(190,24,93,0.55) 0%, rgba(120,10,60,0.25) 45%, transparent 70%), radial-gradient(ellipse 70% 50% at 0% 100%, rgba(88,28,135,0.45) 0%, transparent 70%), radial-gradient(ellipse 60% 40% at 50% 50%, rgba(30,10,40,0.6) 0%, transparent 80%)",
       }}
     >
+      {fxLayer}
       {/* Dark-mode aesthetic background: subtle grid + ghost watermark */}
       <div
         className="pointer-events-none absolute inset-0 z-0 opacity-[0.12]"
@@ -3509,7 +3704,7 @@ export default function StudentPage() {
 
         {/* ---------------- ONBOARDING ---------------- */}
         {activeTab === "onboarding" && (
-          <section className="my-auto bg-black/50 backdrop-blur-xl border border-white/10 rounded-[2rem] p-6 lg:p-8 shadow-2xl shadow-pink-900/20">
+          <section className="my-auto bg-black/50 backdrop-blur-xl glass-card border border-white/10 rounded-[2rem] p-6 lg:p-8 shadow-2xl shadow-pink-900/20">
             {/* phone: one vertical column · laptop: two columns side by side */}
             <form onSubmit={handleCreatePersona} className="space-y-4 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-x-10 lg:gap-y-5 lg:items-center">
               {/* LEFT: nickname */}
@@ -3716,7 +3911,7 @@ export default function StudentPage() {
                 <div className="relative lg:h-full lg:min-h-0">
                   {/* peeking card behind (deck effect) */}
                   <div className="absolute inset-x-4 -bottom-3 lg:-bottom-2 h-full rounded-[2rem] bg-white/5 border border-white/10" />
-                  <div className="relative lg:h-full rounded-[2rem] overflow-hidden border border-white/10 shadow-2xl shadow-pink-900/40 bg-black/60 backdrop-blur-xl lg:grid lg:grid-cols-2">
+                  <div className="relative lg:h-full rounded-[2rem] overflow-hidden border border-white/10 shadow-2xl shadow-pink-900/40 bg-black/60 backdrop-blur-xl glass-card lg:grid lg:grid-cols-2">
                     {/* Hero area */}
                     <div
                       className="relative h-72 lg:h-full flex items-center justify-center"
@@ -3729,7 +3924,8 @@ export default function StudentPage() {
                         {currentCandidate.avatar}
                       </span>
                       <span className="absolute top-4 left-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/50 backdrop-blur-md text-[10px] lg:text-xs font-semibold border border-white/10">
-                        <span className="w-2 h-2 rounded-full bg-emerald-400" /> Online
+                        <span className={`w-2 h-2 rounded-full ${presenceInfo(currentCandidate.id).online ? "bg-emerald-400" : "bg-slate-500"}`} />{" "}
+                        {presenceInfo(currentCandidate.id).online ? "Online" : presenceInfo(currentCandidate.id).label}
                       </span>
                       <span className="absolute top-4 right-4 px-2.5 py-1 rounded-full bg-black/50 backdrop-blur-md text-[10px] lg:text-xs font-semibold border border-pink-500/40 text-pink-300">
                         {currentCandidate.gender}
@@ -3763,14 +3959,14 @@ export default function StudentPage() {
                       </p>
                       <div className="flex flex-wrap items-center justify-end lg:justify-start gap-3 pt-1 lg:pt-2">
                         <button
-                          onClick={() => handleSwipe("pass")}
+                          onClick={(e) => { triggerFx(e, "pass"); handleSwipe("pass"); }}
                           className="w-12 h-12 lg:w-auto lg:h-12 lg:px-6 whitespace-nowrap rounded-full bg-white/10 border border-white/15 text-white/80 text-lg lg:text-base font-semibold cursor-pointer hover:bg-white/20 transition flex items-center justify-center gap-2"
                           title="Pass"
                         >
                           ✕ <span className="hidden lg:inline">Pass</span>
                         </button>
                         <button
-                          onClick={() => handleSwipe("spark")}
+                          onClick={(e) => { triggerFx(e, "spark"); handleSwipe("spark"); }}
                           className="w-14 h-14 lg:w-auto lg:h-12 lg:px-7 whitespace-nowrap rounded-full bg-gradient-to-tr from-pink-500 to-rose-600 text-white text-2xl lg:text-base font-bold cursor-pointer shadow-lg shadow-pink-600/50 hover:scale-105 transition flex items-center justify-center gap-2"
                           title="Send Spark request"
                         >
@@ -3781,7 +3977,7 @@ export default function StudentPage() {
                   </div>
                 </div>
               ) : (
-                <div className="bg-black/50 backdrop-blur-xl border border-white/10 rounded-[2rem] p-10 text-center space-y-3 lg:flex lg:flex-col lg:items-center lg:justify-center">
+                <div className="bg-black/50 backdrop-blur-xl glass-card border border-white/10 rounded-[2rem] p-10 text-center space-y-3 lg:flex lg:flex-col lg:items-center lg:justify-center">
                   <h3 className="text-lg lg:text-2xl font-bold">No more profiles in this filter</h3>
                   <p className="text-xs lg:text-sm text-white/50">
                     Switch between Same College / Different College or reset the swipe deck.
@@ -3797,7 +3993,7 @@ export default function StudentPage() {
 
               {/* Laptop-only side panel: quick access to matches */}
               <aside className="hidden lg:flex flex-col gap-4 min-h-0">
-                <div className="bg-black/50 backdrop-blur-xl border border-white/10 rounded-[2rem] p-5 flex-1 min-h-0 flex flex-col">
+                <div className="bg-black/50 backdrop-blur-xl glass-card border border-white/10 rounded-[2rem] p-5 flex-1 min-h-0 flex flex-col">
                   <h3 className="text-sm font-bold uppercase tracking-wider text-pink-400 mb-3 flex items-center gap-2">
                     ⚡ Your Sparks
                     {pendingIncoming.length > 0 && (
@@ -3881,7 +4077,7 @@ export default function StudentPage() {
 
               <div className="space-y-5 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-6">
                 {/* RECEIVED */}
-                <div className="bg-black/50 backdrop-blur-xl border border-white/10 rounded-[2rem] p-5 space-y-3">
+                <div className="bg-black/50 backdrop-blur-xl glass-card border border-white/10 rounded-[2rem] p-5 space-y-3">
                   <h3 className="text-sm font-bold uppercase tracking-wider text-pink-400">
                     📥 Received ({pendingIncoming.length} waiting)
                   </h3>
@@ -3904,13 +4100,13 @@ export default function StudentPage() {
                         {r.status === "pending" ? (
                           <div className="flex gap-3">
                             <button
-                              onClick={() => handleRejectSpark(r)}
+                              onClick={(e) => { triggerFx(e, "pass"); handleRejectSpark(r); }}
                               className="flex-1 h-12 rounded-full bg-white/10 border border-white/15 text-sm font-semibold cursor-pointer hover:bg-rose-500/30 transition"
                             >
                               ✕ Decline
                             </button>
                             <button
-                              onClick={() => handleAcceptSpark(r)}
+                              onClick={(e) => { triggerFx(e, "spark"); handleAcceptSpark(r); }}
                               className="flex-1 h-12 rounded-full bg-gradient-to-r from-pink-500 to-rose-600 text-sm font-bold cursor-pointer shadow-lg shadow-pink-600/40 hover:scale-[1.02] transition"
                             >
                               ✓ Accept &amp; Chat
@@ -3954,7 +4150,7 @@ export default function StudentPage() {
                 </div>
 
                 {/* SENT */}
-                <div className="bg-black/50 backdrop-blur-xl border border-white/10 rounded-[2rem] p-5 space-y-3">
+                <div className="bg-black/50 backdrop-blur-xl glass-card border border-white/10 rounded-[2rem] p-5 space-y-3">
                   <h3 className="text-sm font-bold uppercase tracking-wider text-pink-400">
                     📤 Sent ({sent.length})
                   </h3>
@@ -4012,7 +4208,7 @@ export default function StudentPage() {
 
         {/* ---------------- CHAT (two panes on laptop) ---------------- */}
         {activeTab === "chat" && (
-          <section className="relative bg-[#0b0610]/85 backdrop-blur-xl border border-white/10 rounded-[2rem] overflow-hidden flex flex-col lg:flex-row h-[calc(100dvh-200px)] min-h-[500px] lg:h-full lg:min-h-0 shadow-2xl shadow-pink-900/20">
+          <section className="relative bg-[#0b0610]/85 backdrop-blur-xl glass-card border border-white/10 rounded-[2rem] overflow-hidden flex flex-col lg:flex-row h-[calc(100dvh-200px)] min-h-[500px] lg:h-full lg:min-h-0 shadow-2xl shadow-pink-900/20">
             <style>{CHAT_ANIM_CSS}</style>
 
             {/* PRIVACY SHIELD: fully opaque + blurred shapes, nothing of the chat can show through */}
@@ -4090,7 +4286,9 @@ export default function StudentPage() {
                             >
                               {m.avatar}
                             </span>
-                            <span className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-emerald-400 border-2 border-[#0b0610]" />
+                            {presenceInfo(m.id).online && (
+                              <span className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-emerald-400 border-2 border-[#0b0610]" />
+                            )}
                           </span>
                           <span className="lg:hidden text-[11px] font-semibold max-w-[64px] truncate">{m.alias}</span>
                           <span className="hidden lg:block min-w-0 flex-1">
@@ -4118,10 +4316,20 @@ export default function StudentPage() {
                         <span className="w-11 h-11 lg:w-12 lg:h-12 rounded-full bg-gradient-to-br from-pink-500/30 to-violet-600/30 flex items-center justify-center text-2xl lg:text-3xl ring-2 ring-pink-500/50">
                           {activeMatch.avatar}
                         </span>
-                        <span className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-emerald-400 border-2 border-[#0b0610]" />
+                        {presenceInfo(activeMatch.id).online && (
+                          <span className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-emerald-400 border-2 border-[#0b0610]" />
+                        )}
                       </span>
                       <div className="min-w-0 flex-1">
                         <p className="text-sm lg:text-base font-extrabold truncate leading-tight">{activeMatch.alias}</p>
+                        <p
+                          className={`text-[11px] leading-tight mt-0.5 flex items-center gap-1.5 ${
+                            presenceInfo(activeMatch.id).online ? "text-emerald-400 font-semibold" : "text-white/45"
+                          }`}
+                        >
+                          {presenceInfo(activeMatch.id).online && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />}
+                          {presenceInfo(activeMatch.id).label}
+                        </p>
                         {/* Highlighted disappearing-messages control */}
                         <button
                           type="button"
@@ -4830,7 +5038,7 @@ export default function StudentPage() {
                     Nobody sees your name. Every student from your college gets it on their wall. 🤫
                   </p>
 
-                  <div className="relative mt-4 rounded-3xl bg-black/30 backdrop-blur-md border border-white/25 p-3">
+                  <div className="relative mt-4 rounded-3xl bg-black/30 glass-card backdrop-blur-md border border-white/25 p-3">
                     <textarea
                       value={confessionText}
                       onChange={(e) => setConfessionText(e.target.value.slice(0, CONFESSION_MAX))}
@@ -4967,7 +5175,7 @@ export default function StudentPage() {
 
         {/* ---------------- PROFILE (two columns on laptop) ---------------- */}
         {activeTab === "profile" && myProfile && (
-          <section className="bg-black/55 backdrop-blur-xl border border-white/10 rounded-[2rem] p-6 lg:p-8 shadow-2xl shadow-pink-900/20 max-h-[78vh] lg:max-h-none overflow-y-auto">
+          <section className="bg-black/55 backdrop-blur-xl glass-card border border-white/10 rounded-[2rem] p-6 lg:p-8 shadow-2xl shadow-pink-900/20 max-h-[78vh] lg:max-h-none overflow-y-auto">
             <div className="space-y-5 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-8">
               <div className="space-y-5">
                 <div className="flex items-center gap-4 border-b border-white/10 pb-4">
