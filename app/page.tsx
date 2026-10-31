@@ -116,6 +116,7 @@ export interface LiveChatSession {
   lastActive: string;
   messages: ChatMessage[];
   startedAt?: string;
+  startedAtMs?: number;
   endedAt?: string;
   status?: "active" | "deleted" | "expired" | "reported" | "ended" | "unmatched";
   participants?: ChatParticipant[];
@@ -1373,6 +1374,7 @@ export default function StudentPage() {
         }),
         messages: mergedMessages,
         startedAt: existing?.startedAt || new Date().toLocaleString(),
+        startedAtMs: existing?.startedAtMs || Date.now(),
         endedAt: wasEnded ? undefined : existing?.endedAt,
         status: wasEnded ? "active" : existing?.status ?? "active",
         participants:
@@ -1775,6 +1777,9 @@ export default function StudentPage() {
       );
       const queueItem = {
         ...newAccount,
+        createdAt:
+          existingQueue.find((i: { email: string; createdAt?: number }) => i.email === newAccount.email)?.createdAt ||
+          Date.now(),
         status: "pending",
         submittedAt: new Date().toLocaleTimeString([], {
           hour: "2-digit",

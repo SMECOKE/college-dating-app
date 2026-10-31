@@ -23,6 +23,7 @@ export interface StudentAccount {
   verificationStatus: "unverified" | "pending" | "verified" | "rejected" | "blocked";
   status?: "pending" | "verified" | "rejected" | "blocked" | "flagged";
   submittedAt?: string;
+  createdAt?: number; // exact sign-up time (ms) – stamped by the student site
   isDuplicateId?: boolean;
 }
 
@@ -215,13 +216,21 @@ export interface LiveChatSession {
   lastActive: string;
   messages: ChatMessage[];
   startedAt?: string;
+  startedAtMs?: number; // exact match time (ms) – stamped by the student site
   endedAt?: string;
   status?: "active" | "deleted" | "expired" | "reported" | "ended" | "unmatched";
   participants?: ChatParticipant[];
 }
 
+// ---- Weekly summary ----
+const FIRST_SEEN_KEY = "heartlink_admin_first_seen"; // fallback timestamps for older records
+const SUMMARY_EMAIL_KEY = "heartlink_admin_summary_email";
+const DAY_MS = 86400000;
+type SummaryRange = "7d" | "30d" | "all";
+type DetailTarget = { account?: StudentAccount; profile?: StudentProfile };
+
 type DesignMode = "kanban" | "terminal" | "obsidian";
-type ActiveSection = "verifications" | "live_chats" | "students" | "flagged_apps" | "reports" | "blocked" | "confessions" | "events";
+type ActiveSection = "weekly" | "verifications" | "live_chats" | "students" | "flagged_apps" | "reports" | "blocked" | "confessions" | "events";
 
 const BANGALORE_COLLEGES = [
   "RV College of Engineering (RVCE)",
@@ -593,6 +602,168 @@ export default function AdminDashboardVariants() {
       clearInterval(interval);
     };
   }, [syncFromCustomerApp]);
+
+  // ---------------- WEEKLY SUMMARY ----------------
+  const [summaryRange, setSummaryRange] = useState<SummaryRange>("7d");
+  const [summaryEmail, setSummaryEmail] = useState<string>("");
+  const [firstSeen, setFirstSeen] = useState<Record<string, number>>({});
+  const [detailTarget, setDetailTarget] = useState<DetailTarget | null>(null);
+
+  useEffect(() => {
+    try {
+      setSummaryEmail(localStorage.getItem(SUMMARY_EMAIL_KEY) || "");
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Older records have no exact date, so remember when the admin first saw each one.
+  useEffect(() => {
+    let stored: Record<string, number> = {};
+    try {
+      stored = JSON.parse(localStorage.getItem(FIRST_SEEN_KEY) || "{}") || {};
+    } catch {
+      stored = {};
+    }
+    const now = Date.now();
+    const next = { ...stored };
+    let changed = false;
+    const mark = (k: string) => {
+      if (!next[k]) {
+        next[k] = now;
+        changed = true;
+      }
+    };
+    verificationQueue.forEach((a) => mark(`acc:${a.id || a.email}`));
+    liveChatSessions.forEach((s) => mark(`sess:${s.sessionId}`));
+    chatReports.forEach((r) => mark(`rep:${r.id}`));
+    if (changed) {
+      try {
+        localStorage.setItem(FIRST_SEEN_KEY, JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+    }
+    setFirstSeen((prev) => (Object.keys(prev).length === Object.keys(next).length ? prev : next));
+  }, [verificationQueue, liveChatSessions, chatReports]);
+
+  const accountTime = (a: StudentAccount) => a.createdAt ?? firstSeen[`acc:${a.id || a.email}`] ?? Date.now();
+  const sessionTime = (s: LiveChatSession) => s.startedAtMs ?? firstSeen[`sess:${s.sessionId}`] ?? Date.now();
+  const reportTime = (r: ReportedUserTicket) => firstSeen[`rep:${r.id}`] ?? Date.now();
+  const fmtDate = (t: number) =>
+    new Date(t).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+
+  const weekly = useMemo(() => {
+    const since = summaryRange === "all" ? 0 : Date.now() - (summaryRange === "7d" ? 7 : 30) * DAY_MS;
+    const signups = verificationQueue
+      .filter((a) => accountTime(a) >= since)
+      .sort((a, b) => accountTime(b) - accountTime(a));
+    const matches = liveChatSessions
+      .filter((s) => sessionTime(s) >= since)
+      .sort((a, b) => sessionTime(b) - sessionTime(a));
+    const reports = chatReports
+      .filter((r) => reportTime(r) >= since)
+      .sort((a, b) => reportTime(b) - reportTime(a));
+    let messages = 0;
+    let flagged = 0;
+    liveChatSessions.forEach((s) =>
+      (s.messages || []).forEach((m) => {
+        if ((m.createdAt ?? sessionTime(s)) >= since) {
+          messages += 1;
+          if (getFlagHits(m.text, flagRe).length > 0) flagged += 1;
+        }
+      })
+    );
+    const status = (a: StudentAccount) => a.verificationStatus || a.status || "pending";
+    return {
+      signups,
+      matches,
+      reports,
+      messages,
+      flagged,
+      verified: signups.filter((a) => status(a) === "verified").length,
+      pending: signups.filter((a) => status(a) === "pending" || status(a) === "unverified").length,
+      rejected: signups.filter((a) => status(a) === "rejected" || status(a) === "blocked").length,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verificationQueue, liveChatSessions, chatReports, summaryRange, firstSeen, flagRe]);
+
+  const rangeLabel = summaryRange === "7d" ? "Last 7 days" : summaryRange === "30d" ? "Last 30 days" : "All time";
+
+  const buildSummaryText = () => {
+    const L: string[] = [];
+    L.push(`CampusSpark - Weekly Summary (${rangeLabel})`);
+    L.push(`Generated: ${new Date().toLocaleString()}`);
+    L.push("");
+    L.push(`New sign-ups: ${weekly.signups.length} (verified ${weekly.verified}, pending ${weekly.pending}, rejected/blocked ${weekly.rejected})`);
+    L.push(`New matches: ${weekly.matches.length}`);
+    L.push(`Messages sent: ${weekly.messages} (flagged-word messages: ${weekly.flagged})`);
+    L.push(`Reports filed: ${weekly.reports.length}`);
+    L.push("");
+    L.push("Students who signed up:");
+    if (weekly.signups.length === 0) L.push("- none");
+    weekly.signups.forEach((a) =>
+      L.push(`- ${a.fullName || "(no name)"} | ${a.email} | ${a.phone || a.phoneMasked || "-"} | ${a.collegeName || "-"} | ${a.verificationStatus || a.status || "pending"}`)
+    );
+    L.push("");
+    L.push("Reports:");
+    if (weekly.reports.length === 0) L.push("- none");
+    weekly.reports.forEach((r) => L.push(`- ${r.reporterAlias} reported ${r.reportedAlias}: ${r.reason}`));
+    return L.join("\n");
+  };
+
+  const emailSummary = () => {
+    const to = summaryEmail.trim();
+    if (!to || !to.includes("@")) {
+      triggerToast("Enter an email address to send the summary to");
+      return;
+    }
+    const body = buildSummaryText();
+    const trimmed = body.length > 1700 ? body.slice(0, 1700) + "\n...(copy or download CSV for the full list)" : body;
+    window.location.href = `mailto:${to}?subject=${encodeURIComponent(`CampusSpark weekly summary (${rangeLabel})`)}&body=${encodeURIComponent(trimmed)}`;
+  };
+
+  const copySummary = async () => {
+    try {
+      await navigator.clipboard.writeText(buildSummaryText());
+      triggerToast("Summary copied");
+    } catch {
+      triggerToast("Could not copy - select and copy manually");
+    }
+  };
+
+  const downloadSignupsCsv = () => {
+    const esc = (v: string | undefined) => `"${(v || "").replace(/"/g, '""')}"`;
+    const rows = [
+      ["Signed up", "Full name", "Email", "Phone", "College", "Location", "Branch", "Year", "Login method", "Status"].join(","),
+      ...weekly.signups.map((a) =>
+        [
+          esc(new Date(accountTime(a)).toLocaleString()),
+          esc(a.fullName),
+          esc(a.email),
+          esc(a.phone || a.phoneMasked),
+          esc(a.collegeName),
+          esc(a.baseLocation),
+          esc(a.branch),
+          esc(a.year),
+          esc(a.authProvider),
+          esc(a.verificationStatus || a.status),
+        ].join(",")
+      ),
+    ];
+    const blob = new Blob([rows.join("\n")], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `campusspark-signups-${summaryRange}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const openStudentDetail = (a: StudentAccount) => {
+    const profile = students.find((s) => s.id === a.id || (!!s.email && s.email === a.email));
+    setDetailTarget({ account: a, profile });
+  };
 
   const handleVerifyDecision = (
     ticketId: string,
@@ -1146,6 +1317,169 @@ export default function AdminDashboardVariants() {
       )}
 
       {/* Manage Student Modal */}
+      {detailTarget && (() => {
+        const a = detailTarget.account;
+        const p = detailTarget.profile;
+        const email = a?.email || p?.email || "";
+        const alias = p?.alias || "";
+        const mySessions = liveChatSessions.filter(
+          (s) =>
+            (!!email && (s.userEmail === email || (s.participants || []).some((x) => x.email === email))) ||
+            (!!alias && (s.userAlias === alias || s.targetAlias === alias))
+        );
+        const reportsAgainst = chatReports.filter((r) => !!alias && r.reportedAlias === alias);
+        const reportsBy = chatReports.filter((r) => !!email && r.reporterEmail === email);
+        let sentCount = 0;
+        let flaggedCount = 0;
+        mySessions.forEach((s) =>
+          (s.messages || []).forEach((m) => {
+            if (alias && aliasFromLabel(m.senderAlias) === alias) {
+              sentCount += 1;
+              if (getFlagHits(m.text, flagRe).length > 0) flaggedCount += 1;
+            }
+          })
+        );
+        const Row = ({ k, v }: { k: string; v?: React.ReactNode }) => (
+          <div className="flex justify-between gap-4 py-1 border-b border-slate-800/60 text-xs">
+            <span className="text-slate-400">{k}</span>
+            <span className="text-slate-100 text-right break-all">{v || "—"}</span>
+          </div>
+        );
+        const frontImg = a?.idCardFrontImage || p?.idCardFrontImage;
+        const backImg = a?.idCardBackImage || p?.idCardBackImage;
+        return (
+          <div
+            onClick={() => setDetailTarget(null)}
+            className="fixed inset-0 z-40 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-slate-900 border border-slate-700 rounded-3xl p-6 max-w-2xl w-full space-y-5 shadow-2xl max-h-[88vh] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div className="flex items-center gap-3">
+                  <span className="text-4xl">{p?.avatar || "🎓"}</span>
+                  <div>
+                    <h3 className="font-bold text-base text-pink-400">{a?.fullName || p?.fullName || "Student"}</h3>
+                    <p className="text-[11px] text-slate-400">{alias ? `@${alias}` : "No profile alias yet"}</p>
+                  </div>
+                </div>
+                <button onClick={() => setDetailTarget(null)} className="text-slate-400 hover:text-white text-sm cursor-pointer">
+                  ✕ Close
+                </button>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2 text-center">
+                {[
+                  { l: "Chats", v: mySessions.length },
+                  { l: "Messages sent", v: sentCount },
+                  { l: "Flagged msgs", v: flaggedCount },
+                ].map((x) => (
+                  <div key={x.l} className="bg-slate-950 border border-slate-800 rounded-xl py-2">
+                    <p className={`text-xl font-bold ${x.l === "Flagged msgs" && x.v > 0 ? "text-red-400" : "text-white"}`}>{x.v}</p>
+                    <p className="text-[10px] text-slate-500 uppercase">{x.l}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div>
+                <p className="text-[11px] font-bold text-slate-300 uppercase mb-1">Account</p>
+                <Row k="Signed up" v={a ? new Date(accountTime(a)).toLocaleString() : undefined} />
+                <Row k="Email" v={email} />
+                <Row k="Phone" v={a?.phone || p?.phone || a?.phoneMasked} />
+                <Row k="Login method" v={a?.authProvider === "google_oauth" ? "Google" : a?.authProvider === "email_otp" ? "Email OTP" : a?.authProvider} />
+                <Row k="Verification status" v={a?.verificationStatus || a?.status || p?.status} />
+                <Row k="Duplicate ID flag" v={a?.isDuplicateId ? "⚠ Yes" : "No"} />
+                <Row k="Account ID" v={a?.id || p?.id} />
+              </div>
+
+              <div>
+                <p className="text-[11px] font-bold text-slate-300 uppercase mb-1">Personal &amp; college</p>
+                <Row k="Full name" v={a?.fullName || p?.fullName} />
+                <Row k="Gender" v={a?.gender || p?.gender} />
+                <Row k="Date of birth" v={p?.dob} />
+                <Row k="College" v={a?.collegeName || p?.collegeName} />
+                <Row k="Base location" v={a?.baseLocation || p?.baseLocation} />
+                <Row k="Branch" v={a?.branch} />
+                <Row k="Year" v={a?.year} />
+                <Row k="Dept &amp; year (profile)" v={p?.yearDept} />
+              </div>
+
+              <div>
+                <p className="text-[11px] font-bold text-slate-300 uppercase mb-1">Profile</p>
+                <Row k="Alias" v={alias} />
+                <Row k="Bio" v={p?.bio} />
+                <Row k="Interests" v={p?.interests && p.interests.length > 0 ? p.interests.join(", ") : undefined} />
+                <Row k="Profile status" v={p?.status} />
+              </div>
+
+              {(frontImg || backImg) && (
+                <div>
+                  <p className="text-[11px] font-bold text-slate-300 uppercase mb-2">College ID (click to enlarge)</p>
+                  <div className="grid grid-cols-2 gap-3">
+                    {frontImg && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={frontImg} alt="Front ID" onClick={() => setPreviewIdImage(frontImg)} className="rounded-xl border border-slate-700 cursor-pointer max-h-40 w-full object-cover" />
+                    )}
+                    {backImg && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={backImg} alt="Back ID" onClick={() => setPreviewIdImage(backImg)} className="rounded-xl border border-slate-700 cursor-pointer max-h-40 w-full object-cover" />
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <p className="text-[11px] font-bold text-slate-300 uppercase mb-1">Chats ({mySessions.length})</p>
+                {mySessions.length === 0 ? (
+                  <p className="text-xs text-slate-500">No chats yet.</p>
+                ) : (
+                  <div className="space-y-1 max-h-40 overflow-y-auto">
+                    {mySessions.map((s) => (
+                      <div
+                        key={s.sessionId}
+                        onClick={() => {
+                          setDetailTarget(null);
+                          setInspectLiveSession(s);
+                        }}
+                        className="flex justify-between text-xs bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 cursor-pointer hover:border-pink-500"
+                      >
+                        <span className="truncate">{s.userAlias} ↔ {s.targetAlias}</span>
+                        <span className="text-slate-500 flex-shrink-0">{(s.messages || []).length} msgs · {s.status || "active"}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <p className="text-[11px] font-bold text-slate-300 uppercase mb-1">
+                  Reports (against: {reportsAgainst.length} · filed: {reportsBy.length})
+                </p>
+                {reportsAgainst.length + reportsBy.length === 0 ? (
+                  <p className="text-xs text-slate-500">No reports involving this student.</p>
+                ) : (
+                  <div className="space-y-1 max-h-32 overflow-y-auto">
+                    {[...reportsAgainst.map((r) => ({ r, kind: "Against" })), ...reportsBy.map((r) => ({ r, kind: "Filed" }))].map(({ r, kind }) => (
+                      <div
+                        key={kind + r.id}
+                        onClick={() => {
+                          setDetailTarget(null);
+                          setInspectReportTicket(r);
+                        }}
+                        className="text-xs bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 cursor-pointer hover:border-red-500"
+                      >
+                        <span className="text-red-300 font-semibold">{kind}:</span> {r.reporterAlias} → {r.reportedAlias} · {r.reason}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {managedStudent && (
         <div
           onClick={() => setManagedStudent(null)}
@@ -1478,6 +1812,16 @@ export default function AdminDashboardVariants() {
               }`}
             >
               🤫 Confessions ({confessions.length})
+            </button>
+            <button
+              onClick={() => setActiveSection("weekly")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer whitespace-nowrap ${
+                activeSection === "weekly"
+                  ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              📅 Weekly ({weekly.signups.length})
             </button>
             <button
               onClick={() => setActiveSection("events")}
@@ -2418,6 +2762,190 @@ export default function AdminDashboardVariants() {
             </div>
           );
         })()}
+
+        {activeSection === "weekly" && (
+          <section className="space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-xl font-bold">📅 Weekly Summary</h2>
+                <p className="text-xs text-slate-400">Sign-ups, matches and reports. Click any student to see every detail.</p>
+              </div>
+              <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800">
+                {(
+                  [
+                    { id: "7d", label: "Last 7 days" },
+                    { id: "30d", label: "Last 30 days" },
+                    { id: "all", label: "All time" },
+                  ] as { id: SummaryRange; label: string }[]
+                ).map((r) => (
+                  <button
+                    key={r.id}
+                    onClick={() => setSummaryRange(r.id)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition ${
+                      summaryRange === r.id ? "bg-pink-600 text-white" : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* STAT CARDS */}
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+              {[
+                { label: "New sign-ups", value: weekly.signups.length, sub: `${weekly.verified} verified · ${weekly.pending} pending`, color: "text-emerald-400" },
+                { label: "New matches", value: weekly.matches.length, sub: "chats started", color: "text-pink-400" },
+                { label: "Messages", value: weekly.messages, sub: "sent in this period", color: "text-sky-400" },
+                { label: "Flagged messages", value: weekly.flagged, sub: "contain flagged words", color: "text-red-400" },
+                { label: "Reports", value: weekly.reports.length, sub: "filed by students", color: "text-amber-400" },
+              ].map((c) => (
+                <div key={c.label} className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4">
+                  <p className="text-[10px] text-slate-400 uppercase tracking-wide">{c.label}</p>
+                  <p className={`text-3xl font-bold mt-1 ${c.color}`}>{c.value}</p>
+                  <p className="text-[10px] text-slate-500 mt-0.5">{c.sub}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* EMAIL / EXPORT */}
+            <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 space-y-3">
+              <p className="text-sm font-bold">📧 Send this summary</p>
+              <div className="flex flex-wrap gap-2">
+                <input
+                  type="email"
+                  value={summaryEmail}
+                  onChange={(e) => {
+                    setSummaryEmail(e.target.value);
+                    try {
+                      localStorage.setItem(SUMMARY_EMAIL_KEY, e.target.value);
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                  placeholder="Your email address..."
+                  className="flex-1 min-w-[220px] bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500"
+                />
+                <button onClick={emailSummary} className="px-4 py-2 rounded-xl bg-gradient-to-r from-pink-600 to-violet-600 text-white text-xs font-semibold cursor-pointer">
+                  Email me this summary
+                </button>
+                <button onClick={copySummary} className="px-3 py-2 rounded-xl bg-slate-800 text-slate-200 text-xs cursor-pointer hover:bg-slate-700">
+                  Copy
+                </button>
+                <button onClick={downloadSignupsCsv} className="px-3 py-2 rounded-xl bg-slate-800 text-slate-200 text-xs cursor-pointer hover:bg-slate-700">
+                  ⬇ Sign-ups CSV
+                </button>
+              </div>
+              <p className="text-[10px] text-slate-500">
+                &quot;Email me&quot; opens your mail app with the summary filled in. Fully automatic weekly emails need a server.
+              </p>
+            </div>
+
+            {/* NEW SIGN-UPS */}
+            <div className="bg-slate-900/80 border border-slate-800 rounded-2xl overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                <h3 className="font-bold text-sm">🧑‍🎓 Students who signed up ({weekly.signups.length})</h3>
+                <span className="text-[10px] text-slate-500">{rangeLabel}</span>
+              </div>
+              {weekly.signups.length === 0 ? (
+                <p className="p-6 text-center text-xs text-slate-500">No sign-ups in this period.</p>
+              ) : (
+                <div className="divide-y divide-slate-800/80">
+                  {weekly.signups.map((a) => {
+                    const st = a.verificationStatus || a.status || "pending";
+                    return (
+                      <div
+                        key={a.id || a.email}
+                        onClick={() => openStudentDetail(a)}
+                        className="flex items-center gap-3 px-4 py-3 hover:bg-slate-800/60 cursor-pointer transition"
+                      >
+                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-pink-500/30 to-violet-500/30 border border-slate-700 flex items-center justify-center text-sm font-bold flex-shrink-0">
+                          {(a.fullName || a.email || "?").charAt(0).toUpperCase()}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-bold truncate">{a.fullName || "(no name)"}</p>
+                          <p className="text-[11px] text-sky-300 truncate">{a.email}</p>
+                          <p className="text-[10px] text-slate-500 truncate">
+                            {a.collegeName || "—"} · {a.branch || "—"} {a.year || ""}
+                          </p>
+                        </div>
+                        <div className="text-right flex-shrink-0 space-y-1">
+                          <span
+                            className={`inline-block text-[9px] font-bold uppercase px-2 py-0.5 rounded-full border ${
+                              st === "verified"
+                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                                : st === "rejected" || st === "blocked"
+                                ? "bg-red-500/10 text-red-400 border-red-500/30"
+                                : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                            }`}
+                          >
+                            {st}
+                          </span>
+                          <p className="text-[10px] text-slate-500">{fmtDate(accountTime(a))}</p>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* MATCHES + REPORTS */}
+            <div className="grid lg:grid-cols-2 gap-6">
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl overflow-hidden">
+                <div className="px-4 py-3 border-b border-slate-800">
+                  <h3 className="font-bold text-sm">💞 New matches ({weekly.matches.length})</h3>
+                </div>
+                {weekly.matches.length === 0 ? (
+                  <p className="p-6 text-center text-xs text-slate-500">No new matches in this period.</p>
+                ) : (
+                  <div className="divide-y divide-slate-800/80 max-h-80 overflow-y-auto">
+                    {weekly.matches.map((s) => (
+                      <div
+                        key={s.sessionId}
+                        onClick={() => setInspectLiveSession(s)}
+                        className="px-4 py-2.5 hover:bg-slate-800/60 cursor-pointer text-xs flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate font-semibold">
+                          {s.userAlias} ↔ {s.targetAlias}
+                        </span>
+                        <span className="text-[10px] text-slate-500 flex-shrink-0">
+                          {(s.messages || []).length} msgs · {fmtDate(sessionTime(s))}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl overflow-hidden">
+                <div className="px-4 py-3 border-b border-slate-800">
+                  <h3 className="font-bold text-sm">🚨 Reports ({weekly.reports.length})</h3>
+                </div>
+                {weekly.reports.length === 0 ? (
+                  <p className="p-6 text-center text-xs text-slate-500">No reports in this period.</p>
+                ) : (
+                  <div className="divide-y divide-slate-800/80 max-h-80 overflow-y-auto">
+                    {weekly.reports.map((r) => (
+                      <div
+                        key={r.id}
+                        onClick={() => setInspectReportTicket(r)}
+                        className="px-4 py-2.5 hover:bg-slate-800/60 cursor-pointer text-xs space-y-0.5"
+                      >
+                        <p className="font-semibold truncate">
+                          {r.reporterAlias} reported {r.reportedAlias}
+                        </p>
+                        <p className="text-[10px] text-slate-500 truncate">
+                          {r.reason} · {fmtDate(reportTime(r))}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
 
         {activeSection === "events" && (
           <div className="max-w-xl bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-4">
